@@ -1,78 +1,68 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Path
 from pydantic import BaseModel
 from typing import Dict, Any
-import numpy as np
-import joblib
-from sklearn.linear_model import LinearRegression
 
-app = FastAPI(title="Simple Forecasting Microservice")
+from database import save_training_input, get_all_training_inputs, delete_training_input
+from models import train_model, predict  # your existing model functions
 
-# initialize blank model
-model = LinearRegression()
+app = FastAPI(title="Dynamic Forecasting Microservice")
 
-# Define input format
-class DataInput(BaseModel):
+# -----------------------
+# Request Models
+# -----------------------
+class TrainingRequest(BaseModel):
+    department: str
+    model_type: str
     data: Dict[str, Any]
 
-@app.get("/")
-def root():
-    return {"message": "Forecasting Microservice is running!"}
+    model_config = {"protected_namespaces": ()}
 
+class PredictRequest(BaseModel):
+    department: str
+    model_type: str
+    input: Dict[str, Any]
+
+    model_config = {"protected_namespaces": ()}
+
+# -----------------------
+# Endpoints
+# -----------------------
 @app.post("/train")
-def train_model(payload: DataInput):
+def train(payload: TrainingRequest):
     try:
-        save_training_input(payload.data)  # store raw input
-        data = payload.data
-        X = np.array(data["X"]).reshape(-1, 1)
-        y = np.array(data["y"])
-        model.fit(X, y)
-        joblib.dump(model, "model.pkl")
-        return {"message": "Model trained successfully!"}
+        save_training_input(payload.department, payload.model_type, payload.data)
+        result = train_model(payload.department, payload.model_type, payload.data)
+        return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/predict")
-def predict(payload: DataInput):
+def forecast(payload: PredictRequest):
     try:
-        model = joblib.load("model.pkl")
-        input_data = np.array(payload.data["X"]).reshape(-1, 1)
-        predictions = model.predict(input_data).tolist()
+        predictions = predict(payload.department, payload.model_type, payload.input)
         return {"predictions": predictions}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Model not trained yet")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
-# Database Related Code 
-
-from sqlalchemy import create_engine, Column, Integer, String, JSON, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from datetime import datetime
-import json
-
-# Database setup
-DATABASE_URL = "sqlite:///./ML-Capstone.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-# Database model for training data only
-class TrainingInput(Base):
-    __tablename__ = "training_input"
-    id = Column(Integer, primary_key=True, index=True)
-    payload = Column(JSON)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-
-Base.metadata.create_all(bind=engine)
-
-# Save only training inputs
-def save_training_input(data: dict):
-    db = SessionLocal()
+@app.get("/data")
+def read_all_training_data(
+    department: str | None = Query(default=None, description="Filter by department"),
+    model_type: str | None = Query(default=None, description="Filter by model type")
+):
     try:
-        db_entry = TrainingInput(payload=data)  # store dict directly
-        db.add(db_entry)
-        db.commit()
-    finally:
-        db.close()
+        return get_all_training_inputs(department=department, model_type=model_type)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/train/{input_id}")
+def delete_training_input_endpoint(input_id: int = Path(..., description="ID of the training input to delete")):
+    """
+    Delete a specific training input by its ID.
+    """
+    try:
+        result = delete_training_input(input_id)
+        return result
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
