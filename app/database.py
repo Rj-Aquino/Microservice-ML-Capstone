@@ -1,3 +1,4 @@
+import json
 from fastapi import HTTPException
 from sqlalchemy import create_engine, Column, Integer, String, JSON, DateTime
 from sqlalchemy.ext.declarative import declarative_base
@@ -26,10 +27,22 @@ Base.metadata.create_all(bind=engine)
 def save_training_input(department: str, model_type: str, data: dict):
     db = SessionLocal()
     try:
+        # ✅ Convert NumPy arrays to lists before saving
+        def convert(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, dict):
+                return {k: convert(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [convert(x) for x in obj]
+            return obj
+
+        clean_data = convert(data)
+
         db_entry = TrainingInput(
             department=department,
             model_type=model_type,
-            payload=data
+            payload=json.dumps(clean_data)
         )
         db.add(db_entry)
         db.commit()
