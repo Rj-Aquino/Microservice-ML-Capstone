@@ -4,17 +4,28 @@ import pandas as pd
 from pydantic import BaseModel
 from typing import Dict, Any
 
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.metrics import r2_score
 
-from preprocess import inverse_transform_y, preprocess_input_data, preprocess_training_data
-from database import save_training_input, get_all_training_inputs, delete_training_input
+from preprocess import validate_and_normalize
+
+from database import save_training_input, get_all_training_inputs
 from models import train_model, predict  # your existing model functions
+from scaler import delete_department_assets
 
-from validation import validate_and_normalize
 from models import MODEL_INFO
+from database import TrainingInput, SessionLocal
 
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Dynamic Forecasting Microservice")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or ["http://localhost:3000"] if you want to restrict it
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -----------------------
 # Request Models
@@ -57,19 +68,20 @@ async def get_model_info(model_type: str):
 @app.post("/train")
 def train(payload: TrainingRequest):
     try:
-        # 1️⃣ Validate and normalize raw input
-        validated_data = validate_and_normalize(payload.model_type, payload.data, is_training=True)
+        raw_data = payload.data  # Keep raw data
 
-        # 2️⃣ Preprocess for linear regression (multi-feature support)
-        if payload.model_type.lower() == "linear":
-            X_scaled, y_scaled = preprocess_training_data(validated_data, payload.department)
-            # Flatten y for sklearn, X can be multi-dimensional
-            validated_data = {"X": X_scaled.tolist(), "y": y_scaled.ravel().tolist()}
+        # 1️⃣ Validate and normalize raw input for training
+        validated_data = validate_and_normalize(
+            payload.model_type,
+            raw_data,
+            is_training=True,
+            department=payload.department
+        )
 
-        # 3️⃣ Save the processed training input
-        save_training_input(payload.department, payload.model_type, validated_data)
+        # 2️⃣ Save the raw data (not scaled) to the DB
+        save_training_input(payload.department, payload.model_type, raw_data)
 
-        # 4️⃣ Train the model
+        # 3️⃣ Train the model using normalized/scaled data
         result = train_model(payload.department, payload.model_type, validated_data)
 
         return result
@@ -78,30 +90,23 @@ def train(payload: TrainingRequest):
         raise e
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
+    
 @app.post("/predict")
-def forecast(payload: PredictRequest):
-    """
-    Predict using a specific department's trained model.
-    Supports multi-feature X for Linear Regression.
-    """
-    try:
-        # ✅ Validate input
-        validated_input = validate_and_normalize(payload.model_type, payload.input, is_training=False)
+async def predict_model(payload: dict):
+    department = payload.get("department")
+    model_type = payload.get("model_type")
+    input_data = payload.get("input")
 
-        # For linear, preprocess with scaler
-        if payload.model_type.lower() == "linear":
-            X_scaled = preprocess_input_data(validated_input, payload.department)
-            validated_input = {"X": X_scaled.tolist()}
+    if not department:
+        raise HTTPException(status_code=400, detail="Department is required for prediction.")
+    if not model_type:
+        raise HTTPException(status_code=400, detail="Model type is required.")
 
-        predictions = predict(payload.department, payload.model_type, validated_input)
-        return {"predictions": predictions}
-
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
+    # ✅ Pass department into validation
+    validated = validate_and_normalize(model_type, input_data, is_training=False, department=department)
+    
+    preds = predict(department, model_type, validated)
+    return {"department": department, "model_type": model_type, "predictions": preds}
 
 @app.post("/validate_accuracy")
 def validate_accuracy(payload: AccuracyRequest):
@@ -110,37 +115,54 @@ def validate_accuracy(payload: AccuracyRequest):
     Returns R² for Linear, predicted vs actual for ARIMA/Prophet.
     Supports multi-feature X for Linear Regression.
     """
+    import numpy as np
+    import pandas as pd
+    from sklearn.metrics import r2_score
+    from fastapi import HTTPException
+
     dept = payload.department
     model_type = payload.model_type.lower()
     data = payload.test_data
 
     try:
+        # === LINEAR REGRESSION ===
         if model_type == "linear":
             X_test = np.array(data.get("X", []), dtype=float)
             y_true = np.array(data.get("y", []), dtype=float)
 
-            # Reshape if single feature
+            # Ensure proper shapes
             if X_test.ndim == 1:
                 X_test = X_test.reshape(-1, 1)
             if y_true.ndim > 1:
                 y_true = y_true.ravel()
 
-            # Normalize using department scaler
-            X_scaled = preprocess_input_data({"X": X_test.tolist()}, dept)
-            y_pred = np.array(predict(dept, model_type, {"X": X_scaled.tolist()}), dtype=float)
+            # Predict using same department model
+            prediction_response = predict(dept, model_type, {"X": X_test.tolist()})
+            if isinstance(prediction_response, dict) and "predictions" in prediction_response:
+                y_pred = np.array(prediction_response["predictions"], dtype=float)
+            else:
+                y_pred = np.array(prediction_response, dtype=float)
 
             score = r2_score(y_true, y_pred)
-            return {"R2_score": score, "y_true": y_true.tolist(), "y_pred": y_pred.tolist()}
+            return {
+                "R2_score": float(score),
+                "y_true": y_true.tolist(),
+                "y_pred": y_pred.tolist()
+            }
 
+        # === ARIMA MODEL ===
         elif model_type == "arima":
             series = np.array(data.get("values", []), dtype=float)
             if len(series) < 3:
                 raise HTTPException(status_code=400, detail="ARIMA requires at least 3 values for testing")
 
             steps = len(series)
-            y_pred = np.array(predict(dept, model_type, {"steps_ahead": steps}), dtype=float)
+            prediction_response = predict(dept, model_type, {"steps_ahead": steps})
+            y_pred = np.array(prediction_response.get("predictions", []), dtype=float)
+
             return {"y_true": series.tolist(), "y_pred": y_pred.tolist()}
 
+        # === PROPHET MODEL ===
         elif model_type == "prophet":
             dates = pd.to_datetime(data.get("dates", []))
             values = np.array(data.get("values", []), dtype=float)
@@ -148,7 +170,9 @@ def validate_accuracy(payload: AccuracyRequest):
                 raise HTTPException(status_code=400, detail="'dates' and 'values' must have same length")
 
             steps = len(values)
-            y_pred = np.array(predict(dept, model_type, {"steps_ahead": steps}), dtype=float)
+            prediction_response = predict(dept, model_type, {"steps_ahead": steps})
+            y_pred = np.array(prediction_response.get("predictions", []), dtype=float)
+
             return {"y_true": values.tolist(), "y_pred": y_pred.tolist()}
 
         else:
@@ -167,16 +191,27 @@ def read_all_training_data(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.delete("/train/{input_id}")
-def delete_training_input_endpoint(input_id: int = Path(..., description="ID of the training input to delete")):
-    """
-    Delete a specific training input by its ID.
-    """
+@app.delete("/train/{train_id}")
+async def delete_trained_model(train_id: int):
+    """Delete a trained model entry and its related files."""
+    db = SessionLocal()
     try:
-        result = delete_training_input(input_id)
-        return result
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    
+        # 🔹 Fetch the entry first
+        entry = db.query(TrainingInput).filter(TrainingInput.id == train_id).first()
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"Training input with id {train_id} not found.")
+
+        department = entry.department
+
+        # 🔹 Delete from database
+        db.delete(entry)
+        db.commit()
+
+        # 🔹 Delete related assets (models + scalers)
+        if department:
+            delete_department_assets(department)
+
+        return {"detail": f"Training input {train_id} and assets for '{department}' deleted successfully."}
+
+    finally:
+        db.close()

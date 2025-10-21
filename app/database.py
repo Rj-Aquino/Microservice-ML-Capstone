@@ -58,30 +58,35 @@ def get_all_training_inputs(department: str = None, model_type: str = None):
             query = query.filter(TrainingInput.department == department)
         if model_type:
             query = query.filter(TrainingInput.model_type == model_type)
-        all_entries = query.all()
+        all_entries = query.order_by(TrainingInput.timestamp.desc()).all()
 
         results = []
         for entry in all_entries:
+            try:
+                payload_data = json.loads(entry.payload)
+            except Exception:
+                payload_data = {"error": "Invalid JSON format"}
+
             results.append({
                 "id": entry.id,
                 "department": entry.department,
                 "model_type": entry.model_type,
-                "payload": entry.payload,
-                "timestamp": entry.timestamp.isoformat() if entry.timestamp else None
+                "timestamp": entry.timestamp.strftime("%Y-%m-%d %H:%M:%S") if entry.timestamp else None,
+                "payload_summary": (
+                    {
+                        "X shape": f"{len(payload_data.get('X', []))} samples × "
+                                   f"{len(payload_data['X'][0]) if payload_data.get('X') else 0} features"
+                        if "X" in payload_data else None,
+                        "y count": len(payload_data.get("y", [])) if "y" in payload_data else None,
+                        "values count": len(payload_data.get("values", [])) if "values" in payload_data else None,
+                        "dates count": len(payload_data.get("dates", [])) if "dates" in payload_data else None
+                    }
+                ),
+                "payload_preview": (
+                    {k: payload_data[k][:5] for k in payload_data if isinstance(payload_data[k], list)}
+                    if isinstance(payload_data, dict) else None
+                )
             })
         return results
-    finally:
-        db.close()
-
-def delete_training_input(input_id: int):
-    db = SessionLocal()
-    try:
-        entry = db.query(TrainingInput).filter(TrainingInput.id == input_id).first()
-        if not entry:
-            raise HTTPException(status_code=404, detail=f"Training input with id {input_id} not found.")
-        
-        db.delete(entry)
-        db.commit()
-        return {"message": f"Training input {input_id} deleted successfully."}
     finally:
         db.close()
