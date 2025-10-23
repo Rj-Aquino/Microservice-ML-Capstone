@@ -1,20 +1,16 @@
-from fastapi import HTTPException
-
 import os
-import json
 import numpy as np
+import pandas as pd
 import joblib
+from fastapi import HTTPException
 from sklearn.linear_model import LinearRegression
-from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.arima.model import ARIMA, ARIMAResults
 from prophet import Prophet
 from prophet.serialize import model_to_json, model_from_json
-import pandas as pd
-
-from scaler import load_department_scalers, scalers_X, scalers_y
-from preprocess import inverse_transform_y
-
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
+
+from scaler import save_department_scalers, scalers_X, scalers_y
+from preprocess import validate_and_normalize, inverse_transform_y
 
 # === Directory setup ===
 BASE_MODEL_DIR = "saved_models"
@@ -32,50 +28,29 @@ def get_model_path(department: str, model_type: str, ext: str):
 
 # === TRAINING ===
 def train_model(department: str, model_type: str, data: dict):
-    import os
-    import joblib
-    import numpy as np
-    import pandas as pd
-    from sklearn.linear_model import LinearRegression
-    from sklearn.preprocessing import StandardScaler
-    from statsmodels.tsa.arima.model import ARIMA
-    from prophet import Prophet
-    from prophet.serialize import model_to_json
-
+    model_type = model_type.lower()
     dept_folder = os.path.join(BASE_MODEL_DIR, department)
     os.makedirs(dept_folder, exist_ok=True)
 
-    model_type = model_type.lower()
-
-    # === LINEAR REGRESSION ===
+    # --- LINEAR ---
     if model_type == "linear":
-        X = np.array(data["X"], dtype=float)
-        y = np.array(data["y"], dtype=float).ravel()
+        processed = validate_and_normalize(model_type, data, is_training=True, department=department)
+        X_scaled = np.array(processed["X"], dtype=float)
+        y_scaled = np.array(processed["y"], dtype=float).ravel()
 
-        # Replace NaN or Inf
-        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Fit scalers on all data
-        x_scaler = StandardScaler()
-        y_scaler = StandardScaler()
-        X_scaled = x_scaler.fit_transform(X)
-        y_scaled = y_scaler.fit_transform(y.reshape(-1,1)).ravel()
-
-        # Train model
-        model = LinearRegression()
+        model = LinearRegression(fit_intercept=False)
         model.fit(X_scaled, y_scaled)
 
-        # Save model and scalers
-        joblib.dump(model, get_model_path(department, "linear", "pkl"))
-        joblib.dump(x_scaler, os.path.join(dept_folder, "x_scaler.pkl"))
-        joblib.dump(y_scaler, os.path.join(dept_folder, "y_scaler.pkl"))
+        model_path = get_model_path(department, "linear", "pkl")
+        joblib.dump(model, model_path)
 
-        return {
-            "message": f"Linear Regression model trained successfully for {department}!"
-        }
+        # Save scalers consistently
+        save_department_scalers(department)
 
-    # === ARIMA ===
+        print(f"[DEBUG] Linear model and scalers saved for {department}")
+        return {"message": f"Linear Regression trained for {department}"}
+
+    # --- ARIMA ---
     elif model_type == "arima":
         series = pd.Series(data["values"])
         model = ARIMA(series, order=(2, 1, 2))
@@ -83,7 +58,7 @@ def train_model(department: str, model_type: str, data: dict):
         model_fit.save(get_model_path(department, "arima", "pkl"))
         return {"message": f"ARIMA model trained successfully for {department}!"}
 
-    # === PROPHET ===
+    # --- PROPHET ---
     elif model_type == "prophet":
         df = pd.DataFrame({
             "ds": pd.to_datetime(data["dates"]),
@@ -100,47 +75,29 @@ def train_model(department: str, model_type: str, data: dict):
 
 # === PREDICTION ===
 def predict(department: str, model_type: str, input_data: dict):
-    import os
-    import joblib
-    import numpy as np
-    from fastapi import HTTPException
-    from statsmodels.tsa.arima.model import ARIMAResults
-    from prophet import Prophet
-    from prophet.serialize import model_from_json
-
     model_type = model_type.lower()
 
-    # === LINEAR REGRESSION ===
+    # --- LINEAR ---
     if model_type == "linear":
         model_path = get_model_path(department, "linear", "pkl")
         if not os.path.exists(model_path):
-            raise HTTPException(status_code=404, detail=f"No trained Linear model found for {department}")
+            raise HTTPException(status_code=404, detail=f"No model found for {department}")
         model = joblib.load(model_path)
 
-        # Load scalers from same folder as model
-        dept_folder = os.path.dirname(model_path)
-        x_scaler_path = os.path.join(dept_folder, "x_scaler.pkl")
-        y_scaler_path = os.path.join(dept_folder, "y_scaler.pkl")
-        if not (os.path.exists(x_scaler_path) and os.path.exists(y_scaler_path)):
-            raise HTTPException(status_code=400, detail=f"Missing scalers for department '{department}'")
-        x_scaler = joblib.load(x_scaler_path)
-        y_scaler = joblib.load(y_scaler_path)
+        # Scale input X using saved scalers
+        processed = validate_and_normalize(model_type, input_data, is_training=False, department=department)
+        X_scaled = np.array(processed["X"], dtype=float)
 
-        # Preprocess input
-        X = np.array(input_data.get("X"), dtype=float)
-        if X.ndim == 1:
-            X = X.reshape(-1, 1)
-        if X.size == 0 or np.isnan(X).any() or np.isinf(X).any():
-            raise HTTPException(status_code=400, detail="Invalid input: contains NaN, Inf, or empty values.")
+        y_pred_scaled = model.predict(X_scaled).reshape(-1, 1)
+        y_pred = inverse_transform_y(y_pred_scaled, department).ravel()
 
-        # Scale, predict, inverse-transform
-        X_scaled = x_scaler.transform(X)
-        y_pred_scaled = model.predict(X_scaled)
-        y_pred = y_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
+        return {
+            "department": department,
+            "model_type": "linear",
+            "predictions": y_pred.tolist()
+        }
 
-        return {"department": department, "model_type": "linear", "predictions": y_pred.tolist()}
-
-    # === ARIMA ===
+    # --- ARIMA ---
     elif model_type == "arima":
         model_path = get_model_path(department, "arima", "pkl")
         if not os.path.exists(model_path):
@@ -149,14 +106,13 @@ def predict(department: str, model_type: str, input_data: dict):
         steps = input_data.get("steps_ahead", 5)
         return {"department": department, "model_type": "arima", "predictions": model_fit.forecast(steps=steps).tolist()}
 
-    # === PROPHET ===
+    # --- PROPHET ---
     elif model_type == "prophet":
         model_path = get_model_path(department, "prophet", "json")
         if not os.path.exists(model_path):
             raise HTTPException(status_code=404, detail=f"No trained Prophet model found for {department}")
         with open(model_path, "r") as f:
-            model_json = f.read()
-        model = model_from_json(model_json)
+            model = model_from_json(f.read())
         steps = input_data.get("steps_ahead", 5)
         future = model.make_future_dataframe(periods=steps)
         forecast = model.predict(future)
@@ -165,92 +121,75 @@ def predict(department: str, model_type: str, input_data: dict):
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported model type: {model_type}")
 
+# === VALIDATION ===
+def validate(department: str, model_type: str, test_data: dict):
+    model_type = model_type.lower()
+    try:
+        if model_type == "linear":
+            X_test = np.array(test_data.get("X", []), dtype=float)
+            y_true = np.array(test_data.get("y", []), dtype=float)
+            if X_test.size == 0 or y_true.size == 0:
+                raise HTTPException(status_code=400, detail="Missing test data for X or y.")
+            if X_test.ndim == 1:
+                X_test = X_test.reshape(-1, 1)
+            if y_true.ndim > 1:
+                y_true = y_true.ravel()
+
+            prediction_response = predict(department, "linear", {"X": X_test.tolist()})
+            y_pred = np.array(prediction_response["predictions"], dtype=float)
+            r2 = r2_score(y_true, y_pred)
+
+            return {"department": department, "model_type": "linear", "R2_score": float(r2),
+                    "y_true": y_true.tolist(), "y_pred": y_pred.tolist()}
+
+        elif model_type == "arima":
+            series = np.array(test_data.get("values", []), dtype=float)
+            if len(series) < 3:
+                raise HTTPException(status_code=400, detail="ARIMA requires at least 3 values for testing.")
+            prediction_response = predict(department, "arima", {"steps_ahead": len(series)})
+            y_pred = np.array(prediction_response.get("predictions", []), dtype=float)
+            return {"department": department, "model_type": "arima",
+                    "y_true": series.tolist(), "y_pred": y_pred.tolist()}
+
+        elif model_type == "prophet":
+            dates = pd.to_datetime(test_data.get("dates", []))
+            values = np.array(test_data.get("values", []), dtype=float)
+            if len(dates) != len(values):
+                raise HTTPException(status_code=400, detail="'dates' and 'values' must have same length.")
+            prediction_response = predict(department, "prophet", {"steps_ahead": len(values)})
+            y_pred = np.array(prediction_response.get("predictions", []), dtype=float)
+            return {"department": department, "model_type": "prophet",
+                    "y_true": values.tolist(), "y_pred": y_pred.tolist()}
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported model_type: {model_type}")
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 # === MODEL INFO METADATA ===
 MODEL_INFO = {
     "linear": {
-        "description": "Linear Regression models the relationship between one or more input variables (X) and a continuous output (y).",
-        "use_cases": [
-            "Predicting cost or expenses based on measurable factors",
-            "Forecasting numeric values when relationships are roughly linear"
-        ],
-        "inputs": {
-            "training": {
-                "X": "List[List[float]] - multiple input features per sample",
-                "y": "List[float] - target output"
-            },
-            "prediction": {
-                "X": "List[List[float]] - same number of features used in training"
-            }
-        },
-        "output": "Predicted numeric values for each input sample",
-        "notes": "Works best for static, numeric data with linear relationships. Sensitive to unscaled or unnormalized inputs.",
-        "examples": {
-            "training": {
-                "department": "Bus_Finance",
-                "model_type": "linear",
-                "data": {"X": [[1], [2], [3], [4]], "y": [10, 20, 30, 40]}
-            },
-            "prediction": {
-                "department": "Bus_Finance",
-                "model_type": "linear",
-                "input": {"X": [[5], [6]]}
-            }
-        }
+        "description": "Linear Regression models the relationship between input X and output y.",
+        "use_cases": ["Predict numeric values", "Cost forecasting"],
+        "inputs": {"training": {"X": "List[List[float]]", "y": "List[float]"},
+                   "prediction": {"X": "List[List[float]]"}},
+        "output": "Predicted numeric values",
+        "notes": "Requires scaled inputs",
     },
     "arima": {
-        "description": "ARIMA (AutoRegressive Integrated Moving Average) predicts future values in a time series based on its past values.",
-        "use_cases": [
-            "Predicting passenger counts, revenue, or demand over time",
-            "Forecasting trends with consistent seasonal or temporal patterns"
-        ],
-        "inputs": {
-            "training": {"values": "List[float] - sequential numeric data"},
-            "prediction": {"steps_ahead": "int - number of future steps to forecast"}
-        },
-        "output": "List[float] - predicted future values",
-        "notes": "Univariate only. Ensure the time series is stationary or properly differenced.",
-        "examples": {
-            "training": {
-                "department": "Bus_Operations",
-                "model_type": "arima",
-                "data": {"values": [100, 120, 140, 160, 180]}
-            },
-            "prediction": {
-                "department": "Bus_Operations",
-                "model_type": "arima",
-                "input": {"steps_ahead": 3}
-            }
-        }
+        "description": "ARIMA predicts future values in a time series.",
+        "use_cases": ["Forecasting demand or revenue"],
+        "inputs": {"training": {"values": "List[float]"}, "prediction": {"steps_ahead": "int"}},
+        "output": "Predicted future values",
+        "notes": "Univariate only",
     },
     "prophet": {
-        "description": "Prophet is a time-series forecasting model developed by Facebook, designed for data with trends, seasonality, and holiday effects.",
-        "use_cases": [
-            "Predicting revenue, ridership, or resource usage over time",
-            "Data with daily/weekly/monthly seasonality or irregular trends"
-        ],
-        "inputs": {
-            "training": {
-                "dates": "List[str] - in YYYY-MM-DD format",
-                "values": "List[float] - observed values corresponding to each date"
-            },
-            "prediction": {"steps_ahead": "int - number of future days to forecast"}
-        },
-        "output": "List[float] - forecasted values for the given future dates",
-        "notes": "Can include additional regressors for external factors (e.g., weather, events).",
-        "examples": {
-            "training": {
-                "department": "Bus_HR",
-                "model_type": "prophet",
-                "data": {
-                    "dates": ["2025-10-01", "2025-10-02", "2025-10-03", "2025-10-04"],
-                    "values": [30, 32, 34, 36]
-                }
-            },
-            "prediction": {
-                "department": "Bus_HR",
-                "model_type": "prophet",
-                "input": {"steps_ahead": 3}
-            }
-        }
+        "description": "Prophet forecasts time series with seasonality.",
+        "use_cases": ["Revenue or ridership prediction"],
+        "inputs": {"training": {"dates": "List[str]", "values": "List[float]"},
+                   "prediction": {"steps_ahead": "int"}},
+        "output": "Forecasted values",
+        "notes": "Handles trends and seasonal effects",
     }
 }

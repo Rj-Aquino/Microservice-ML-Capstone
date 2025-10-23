@@ -41,50 +41,48 @@ def clean_training_data(X: np.ndarray, y: np.ndarray, zscore_threshold: float = 
 def validate_linear_data(data: dict, department: str, is_training=True):
     try:
         if is_training:
-            X, y = data.get("X"), data.get("y")
+            # --- Extract and validate raw data ---
+            X = data.get("X")
+            y = data.get("y")
             if X is None or y is None:
                 raise HTTPException(status_code=400, detail="Linear model requires 'X' and 'y'.")
-
             X = np.array(X, dtype=float)
             y = np.array(y, dtype=float).reshape(-1, 1)
-
             if X.ndim == 1:
                 X = X.reshape(-1, 1)
             if X.shape[0] != y.shape[0]:
                 raise HTTPException(status_code=400, detail="Length of 'X' and 'y' must match.")
 
-            # ✅ Auto-clean data before training
+            # --- Clean and validate numeric content ---
             X, y = clean_training_data(X, y)
+            if np.isnan(X).any() or np.isnan(y).any():
+                raise HTTPException(status_code=400, detail="Training data contains NaN values.")
 
-            # Initialize scalers if not exists
-            if department not in scalers_X:
-                scalers_X[department] = StandardScaler()
-                scalers_y[department] = StandardScaler()
-
-            # Fit and scale
+            # --- Initialize and fit scalers ---
+            scalers_X[department] = StandardScaler()
+            scalers_y[department] = StandardScaler()
             X_scaled = scalers_X[department].fit_transform(X)
             y_scaled = scalers_y[department].fit_transform(y)
 
-            # Save expected feature dimensions
+            # --- Save feature dimensions and scalers to `scalers/` folder ---
             feature_dims[department] = X.shape[1]
-
-            # ✅ Save scalers to disk
             save_department_scalers(department)
 
             return {"X": X_scaled.tolist(), "y": y_scaled.tolist()}
 
         else:
+            # --- Prediction phase ---
             X = data.get("X")
             if X is None:
                 raise HTTPException(status_code=400, detail="Linear prediction requires 'X'.")
             X = np.array(X, dtype=float)
-
+            if np.isnan(X).any():
+                raise HTTPException(status_code=400, detail="Input contains NaN values.")
             if X.ndim == 1:
                 X = X.reshape(-1, 1)
 
-            # Ensure scalers are loaded
+            # --- Load scalers from `scalers/` folder ---
             load_department_scalers(department)
-
             if department not in scalers_X:
                 raise HTTPException(status_code=400, detail=f"No scaler found for '{department}'. Train first.")
 
@@ -93,6 +91,9 @@ def validate_linear_data(data: dict, department: str, is_training=True):
                 raise HTTPException(status_code=400, detail=f"Expected {expected_dim} features, got {X.shape[1]}.")
 
             X_scaled = scalers_X[department].transform(X)
+            if np.isnan(X_scaled).any():
+                raise HTTPException(status_code=400, detail="Scaled input produced NaNs — check scaler integrity.")
+
             return {"X": X_scaled.tolist(), "y": None}
 
     except ValueError:
@@ -132,19 +133,12 @@ def validate_prophet_data(data: dict, is_training=True):
 # ==============================
 def validate_and_normalize(model_type: str, data, is_training=True, department: str = None) -> dict:
     model_type = model_type.lower()
+    print(f"\n[DEBUG] === validate_and_normalize() called ===")
+    print(f"[DEBUG] model_type={model_type}, is_training={is_training}, department={department}")
 
     if model_type == "linear":
         if department is None:
             raise HTTPException(status_code=400, detail="Department is required for Linear model validation.")
-
-        # --- 🧩 Handle prediction case (input_data passed as simple list or array)
-        if not is_training and not isinstance(data, dict):
-            X = np.array(data, dtype=float)
-            if X.ndim == 1:
-                X = X.reshape(-1, 1)
-            return {"X": X.tolist()}
-
-        # --- 🧠 Normal training/validation path
         return validate_linear_data(data, department, is_training)
 
     elif model_type == "arima":
