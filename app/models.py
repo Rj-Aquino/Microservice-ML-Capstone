@@ -1,195 +1,328 @@
 import os
+import joblib
 import numpy as np
 import pandas as pd
-import joblib
 from fastapi import HTTPException
 from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.arima.model import ARIMA, ARIMAResults
 from prophet import Prophet
 from prophet.serialize import model_to_json, model_from_json
-from sklearn.metrics import r2_score
 
-from scaler import save_department_scalers, scalers_X, scalers_y
-from preprocess import validate_and_normalize, inverse_transform_y
+# === Local imports ===
+from preprocess import (
+    clean_training_data,
+    validate_linear_data,
+    validate_arima_data,
+    validate_prophet_data,
+    clean_prediction_data
+)
+from scaler import get_scaler_path
 
-# === Directory setup ===
+# === Setup ===
 BASE_MODEL_DIR = "saved_models"
-DEPARTMENTS = ["Bus_Operations", "Bus_Finance", "Bus_Inventory", "Bus_HR"]
+SCALER_DIR = "scalers"
+DEPARTMENTS = ["Operations", "Finance", "Inventory", "HR"]
 
 os.makedirs(BASE_MODEL_DIR, exist_ok=True)
+os.makedirs(SCALER_DIR, exist_ok=True)
 for dept in DEPARTMENTS:
     os.makedirs(os.path.join(BASE_MODEL_DIR, dept), exist_ok=True)
 
-# === PATH HELPERS ===
-def get_model_path(department: str, model_type: str, ext: str):
+def get_model_path(department: str, model_type: str, ext: str = "pkl") -> str:
+    """
+    Return the file path for a department-specific model.
+    Example: get_model_path("Finance", "linear", "pkl") => "saved_models/Finance/model_linear.pkl"
+    """
     if department not in DEPARTMENTS:
         raise ValueError(f"Unknown department: {department}")
-    return os.path.join(BASE_MODEL_DIR, department, f"model_{model_type}.{ext}")
 
-# === TRAINING ===
-def train_model(department: str, model_type: str, data: dict):
+    model_type_clean = model_type.lower()
+    filename = f"model_{model_type_clean}.{ext}"
+    return os.path.join(BASE_MODEL_DIR, department, filename)
+
+# ============================================================
+# === TRAINING FUNCTIONS =====================================
+# ============================================================
+
+def train_model(department: str, model_type: str, cleaned_data: dict):
+    """
+    Trains a model using cleaned (but not normalized) data.
+    Handles normalization, model fitting, and model/scaler saving.
+
+    Assumes:
+      - Data is already cleaned and validated in the API layer.
+      - Database saving is already done in the endpoint.
+    """
     model_type = model_type.lower()
-    dept_folder = os.path.join(BASE_MODEL_DIR, department)
-    os.makedirs(dept_folder, exist_ok=True)
 
-    # --- LINEAR ---
+    if department not in DEPARTMENTS:
+        raise HTTPException(status_code=400, detail=f"Unknown department: {department}")
+
+    print(f"\n🚀 Training {model_type.upper()} model for '{department}' department")
+
+    # ============================
+    # LINEAR MODEL
+    # ============================
     if model_type == "linear":
-        processed = validate_and_normalize(model_type, data, is_training=True, department=department)
-        X_scaled = np.array(processed["X"], dtype=float)
-        y_scaled = np.array(processed["y"], dtype=float).ravel()
+        X = np.array(cleaned_data["X"], dtype=float)
+        y = np.array(cleaned_data["y"], dtype=float)
 
-        model = LinearRegression(fit_intercept=False)
+        # --- Normalize (for training only)
+        scaler_X, scaler_y = StandardScaler(), StandardScaler()
+        X_scaled = scaler_X.fit_transform(X)
+        y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+        print(f"📊 Normalized Linear data: X={X_scaled.shape}, y={y_scaled.shape}")
+
+        # --- Train model
+        model = LinearRegression(fit_intercept=True)
         model.fit(X_scaled, y_scaled)
+        print("🧠 Linear Regression trained successfully")
 
-        model_path = get_model_path(department, "linear", "pkl")
-        joblib.dump(model, model_path)
+        # --- Save model + scalers
+        joblib.dump(model, get_model_path(department, "linear", "pkl"))
+        joblib.dump(scaler_X, get_scaler_path(department, "X"))
+        joblib.dump(scaler_y, get_scaler_path(department, "y"))
+        print("💾 Linear model and scalers saved")
 
-        # Save scalers consistently
-        save_department_scalers(department)
+        return {"message": f"Linear model trained for {department}"}
 
-        print(f"[DEBUG] Linear model and scalers saved for {department}")
-        return {"message": f"Linear Regression trained for {department}"}
-
-    # --- ARIMA ---
+    # ============================
+    # ARIMA MODEL
+    # ============================
     elif model_type == "arima":
-        series = pd.Series(data["values"])
-        model = ARIMA(series, order=(2, 1, 2))
+        values = np.array(cleaned_data["values"], dtype=float)
+
+        if len(values) < 3:
+            raise HTTPException(status_code=400, detail="ARIMA requires ≥ 3 samples")
+
+        print(f"📊 ARIMA input size: {len(values)} samples")
+        model = ARIMA(values, order=(2, 1, 2))
         model_fit = model.fit()
         model_fit.save(get_model_path(department, "arima", "pkl"))
-        return {"message": f"ARIMA model trained successfully for {department}!"}
+        print("🧠 ARIMA model trained and saved")
 
-    # --- PROPHET ---
+        return {"message": f"ARIMA model trained for {department}", "samples": len(values)}
+
+    # ============================
+    # PROPHET MODEL
+    # ============================
     elif model_type == "prophet":
         df = pd.DataFrame({
-            "ds": pd.to_datetime(data["dates"]),
-            "y": data["values"]
+            "ds": pd.to_datetime(cleaned_data["dates"]),
+            "y": cleaned_data["values"]
         })
+        print(f"📊 Prophet input: {len(df)} rows")
+
         model = Prophet()
         model.fit(df)
         with open(get_model_path(department, "prophet", "json"), "w") as f:
             f.write(model_to_json(model))
-        return {"message": f"Prophet model trained successfully for {department}!"}
+        print("🧠 Prophet model trained and saved")
 
+        return {"message": f"Prophet model trained for {department}", "samples": len(df)}
+
+    # ============================
+    # UNSUPPORTED
+    # ============================
     else:
-        raise ValueError("Unsupported model type")
+        raise HTTPException(status_code=400, detail=f"Unsupported model type: {model_type}")
 
-# === PREDICTION ===
+# ============================================================
+# === PREDICTION =============================================
+# ============================================================
+
 def predict(department: str, model_type: str, input_data: dict):
+    """
+    Predicts using a trained model. Assumes model and scalers are saved.
+    Input data should already be cleaned (not normalized).
+    """
     model_type = model_type.lower()
 
-    # --- LINEAR ---
     if model_type == "linear":
+        print(f"\n🔮 Predicting with Linear model for '{department}'")
+
         model_path = get_model_path(department, "linear", "pkl")
-        if not os.path.exists(model_path):
-            raise HTTPException(status_code=404, detail=f"No model found for {department}")
+        scaler_X_path = get_scaler_path(department, "X")
+        scaler_y_path = get_scaler_path(department, "y")
+
+        # --- Check all assets exist
+        if not all(os.path.exists(p) for p in [model_path, scaler_X_path, scaler_y_path]):
+            raise HTTPException(status_code=404, detail="Linear model or scalers not found.")
+
+        # --- Load assets
         model = joblib.load(model_path)
+        scaler_X = joblib.load(scaler_X_path)
+        scaler_y = joblib.load(scaler_y_path)
 
-        # Scale input X using saved scalers
-        processed = validate_and_normalize(model_type, input_data, is_training=False, department=department)
-        X_scaled = np.array(processed["X"], dtype=float)
+        # --- Validate and prepare data
+        cleaned = clean_prediction_data(input_data, "linear")
 
-        y_pred_scaled = model.predict(X_scaled).reshape(-1, 1)
-        y_pred = inverse_transform_y(y_pred_scaled, department).ravel()
+        X = np.array(cleaned["X"], dtype=float)
+        X_scaled = scaler_X.transform(X)
+        print(f"📊 Prediction input shape: {X.shape}")
+
+        # --- Predict and inverse-transform
+        preds_scaled = model.predict(X_scaled).reshape(-1, 1)
+        preds = scaler_y.inverse_transform(preds_scaled).flatten()
+        print(f"✅ Linear predictions done ({len(preds)} samples)")
 
         return {
             "department": department,
             "model_type": "linear",
-            "predictions": y_pred.tolist()
+            "predictions": preds.tolist()
         }
 
-    # --- ARIMA ---
     elif model_type == "arima":
+        print(f"\n🔮 Predicting with ARIMA model for '{department}'")
+
         model_path = get_model_path(department, "arima", "pkl")
         if not os.path.exists(model_path):
-            raise HTTPException(status_code=404, detail=f"No trained ARIMA model found for {department}")
-        model_fit = ARIMAResults.load(model_path)
-        steps = input_data.get("steps_ahead", 5)
-        return {"department": department, "model_type": "arima", "predictions": model_fit.forecast(steps=steps).tolist()}
+            raise HTTPException(status_code=404, detail="ARIMA model not found.")
 
-    # --- PROPHET ---
+        steps = input_data.get("steps_ahead")
+        if not isinstance(steps, int) or steps <= 0:
+            raise HTTPException(status_code=400, detail="'steps_ahead' must be positive int.")
+
+        model_fit = ARIMAResults.load(model_path)
+        preds = model_fit.forecast(steps=steps)
+        print(f"✅ ARIMA predictions generated ({steps} steps ahead)")
+
+        return {
+            "department": department,
+            "model_type": "arima",
+            "predictions": preds.tolist()
+        }
+
     elif model_type == "prophet":
+        print(f"\n🔮 Predicting with Prophet model for '{department}'")
+
         model_path = get_model_path(department, "prophet", "json")
         if not os.path.exists(model_path):
-            raise HTTPException(status_code=404, detail=f"No trained Prophet model found for {department}")
+            raise HTTPException(status_code=404, detail="Prophet model not found.")
+
+        steps = input_data.get("steps_ahead")
+        if not isinstance(steps, int) or steps <= 0:
+            raise HTTPException(status_code=400, detail="'steps_ahead' must be positive int.")
+
         with open(model_path, "r") as f:
             model = model_from_json(f.read())
-        steps = input_data.get("steps_ahead", 5)
+
         future = model.make_future_dataframe(periods=steps)
         forecast = model.predict(future)
-        return {"department": department, "model_type": "prophet", "predictions": forecast["yhat"].tail(steps).tolist()}
+        preds = forecast["yhat"].tail(steps).tolist()
+        print(f"✅ Prophet predictions generated ({steps} future points)")
+
+        return {
+            "department": department,
+            "model_type": "prophet",
+            "predictions": preds
+        }
 
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported model type: {model_type}")
 
-# === VALIDATION ===
+# ============================================================
+# === VALIDATION / EVALUATION ================================
+# ============================================================
+
 def validate(department: str, model_type: str, test_data: dict):
+    """
+    Validates a trained model using test data.
+    Cleans data, performs prediction, and computes performance metrics.
+    """
     model_type = model_type.lower()
-    try:
-        if model_type == "linear":
-            X_test = np.array(test_data.get("X", []), dtype=float)
-            y_true = np.array(test_data.get("y", []), dtype=float)
-            if X_test.size == 0 or y_true.size == 0:
-                raise HTTPException(status_code=400, detail="Missing test data for X or y.")
-            if X_test.ndim == 1:
-                X_test = X_test.reshape(-1, 1)
-            if y_true.ndim > 1:
-                y_true = y_true.ravel()
+    print(f"\n🧪 Validating {model_type.upper()} model for '{department}'")
 
-            prediction_response = predict(department, "linear", {"X": X_test.tolist()})
-            y_pred = np.array(prediction_response["predictions"], dtype=float)
-            r2 = r2_score(y_true, y_pred)
+    if model_type == "linear":
+        cleaned = clean_training_data(test_data, "linear")
+        validate_linear_data(cleaned)
 
-            return {"department": department, "model_type": "linear", "R2_score": float(r2),
-                    "y_true": y_true.tolist(), "y_pred": y_pred.tolist()}
+        X = np.array(cleaned["X"], dtype=float)
+        y_true = np.array(cleaned["y"], dtype=float)
 
-        elif model_type == "arima":
-            series = np.array(test_data.get("values", []), dtype=float)
-            if len(series) < 3:
-                raise HTTPException(status_code=400, detail="ARIMA requires at least 3 values for testing.")
-            prediction_response = predict(department, "arima", {"steps_ahead": len(series)})
-            y_pred = np.array(prediction_response.get("predictions", []), dtype=float)
-            return {"department": department, "model_type": "arima",
-                    "y_true": series.tolist(), "y_pred": y_pred.tolist()}
+        print(f"📊 Validation data shape: X={X.shape}, y={y_true.shape}")
 
-        elif model_type == "prophet":
-            dates = pd.to_datetime(test_data.get("dates", []))
-            values = np.array(test_data.get("values", []), dtype=float)
-            if len(dates) != len(values):
-                raise HTTPException(status_code=400, detail="'dates' and 'values' must have same length.")
-            prediction_response = predict(department, "prophet", {"steps_ahead": len(values)})
-            y_pred = np.array(prediction_response.get("predictions", []), dtype=float)
-            return {"department": department, "model_type": "prophet",
-                    "y_true": values.tolist(), "y_pred": y_pred.tolist()}
+        preds = predict(department, "linear", {"X": X.tolist()})["predictions"]
 
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported model_type: {model_type}")
+        from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        r2 = r2_score(y_true, preds)
+        mae = mean_absolute_error(y_true, preds)
+        rmse = np.sqrt(mean_squared_error(y_true, preds))
 
-# === MODEL INFO METADATA ===
+        print(f"✅ Validation complete → R²={r2:.4f}, MAE={mae:.4f}, RMSE={rmse:.4f}")
+
+        return {
+            "department": department,
+            "model_type": "linear",
+            "metrics": {"R2": r2, "MAE": mae, "RMSE": rmse},
+            "y_true": y_true.tolist(),
+            "y_pred": preds,
+        }
+
+    elif model_type == "arima":
+        cleaned = clean_training_data(test_data, "arima")
+        validate_arima_data(cleaned)
+
+        values = np.array(cleaned["values"], dtype=float)
+        preds = predict(department, "arima", {"steps_ahead": len(values)})["predictions"]
+
+        print(f"✅ ARIMA validation complete ({len(values)} samples)")
+
+        return {
+            "department": department,
+            "model_type": "arima",
+            "y_true": values.tolist(),
+            "y_pred": preds,
+        }
+
+    elif model_type == "prophet":
+        cleaned = clean_training_data(test_data, "prophet")
+        validate_prophet_data(cleaned)
+
+        values = np.array(cleaned["values"], dtype=float)
+        preds = predict(department, "prophet", {"steps_ahead": len(values)})["predictions"]
+
+        print(f"✅ Prophet validation complete ({len(values)} samples)")
+
+        return {
+            "department": department,
+            "model_type": "prophet",
+            "y_true": values.tolist(),
+            "y_pred": preds,
+        }
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported model type: {model_type}")
+
+# ============================================================
+# === MODEL INFO METADATA ====================================
+# ============================================================
+
 MODEL_INFO = {
     "linear": {
-        "description": "Linear Regression models the relationship between input X and output y.",
-        "use_cases": ["Predict numeric values", "Cost forecasting"],
+        "description": "Linear Regression models relationships between input X and output y.",
+        "use_cases": ["Predict numeric values", "Cost or performance forecasting"],
         "inputs": {"training": {"X": "List[List[float]]", "y": "List[float]"},
                    "prediction": {"X": "List[List[float]]"}},
         "output": "Predicted numeric values",
-        "notes": "Requires scaled inputs",
+        "notes": "Inputs are normalized internally before fitting.",
     },
     "arima": {
         "description": "ARIMA predicts future values in a time series.",
         "use_cases": ["Forecasting demand or revenue"],
-        "inputs": {"training": {"values": "List[float]"}, "prediction": {"steps_ahead": "int"}},
-        "output": "Predicted future values",
-        "notes": "Univariate only",
+        "inputs": {"training": {"values": "List[float]"},
+                   "prediction": {"steps_ahead": "int"}},
+        "output": "Future values",
+        "notes": "Univariate time-series only.",
     },
     "prophet": {
-        "description": "Prophet forecasts time series with seasonality.",
+        "description": "Prophet forecasts time series with seasonality and trend adjustments.",
         "use_cases": ["Revenue or ridership prediction"],
         "inputs": {"training": {"dates": "List[str]", "values": "List[float]"},
                    "prediction": {"steps_ahead": "int"}},
         "output": "Forecasted values",
-        "notes": "Handles trends and seasonal effects",
-    }
+        "notes": "Automatically handles missing data and seasonality.",
+    },
 }

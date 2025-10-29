@@ -1,159 +1,246 @@
 import numpy as np
+from scipy import stats
 from fastapi import HTTPException
-from sklearn.preprocessing import StandardScaler
-from scaler import (
-    load_department_scalers,
-    save_department_scalers,
-    scalers_X,
-    scalers_y,
-    feature_dims,
-)
 
-# ==============================
-# AUTO-CLEANING FUNCTION
-# ==============================
-def clean_training_data(X: np.ndarray, y: np.ndarray, zscore_threshold: float = 3.0):
-    """Remove NaNs, duplicates, and extreme outliers automatically."""
-    initial_len = len(X)
+# ============================================================
+# Helper: Z-score mask for outlier detection
+# ============================================================
+def _zscore_mask(values: np.ndarray, threshold: float = 2.0):
+    """
+    Boolean mask to remove outliers using z-score.
+    - Uses sample std (ddof=1) for better sensitivity on small datasets.
+    - If std is 0 or dataset < 2 points, no points are removed.
+    """
+    values = np.array(values, dtype=float)
+    n = len(values)
 
-    # Remove rows with NaN
-    mask = ~np.isnan(X).any(axis=1) & ~np.isnan(y).any(axis=1)
-    X, y = X[mask], y[mask]
+    if n < 2:  # Too few points to reliably detect outliers
+        return np.ones(n, dtype=bool)
 
-    # Remove duplicates
-    Xy = np.hstack([X, y])
-    Xy_unique = np.unique(Xy, axis=0)
-    X, y = Xy_unique[:, :-1], Xy_unique[:, -1].reshape(-1, 1)
+    mean = values.mean()
+    std = values.std(ddof=1)  # sample std
+    if std == 0:
+        return np.ones(n, dtype=bool)
 
-    # Remove outliers using z-score
-    z_scores = np.abs((X - np.mean(X, axis=0)) / np.std(X, axis=0))
-    mask = (z_scores < zscore_threshold).all(axis=1)
-    X, y = X[mask], y[mask]
+    z_scores = np.abs((values - mean) / std)
+    return z_scores < threshold
 
-    cleaned_len = len(X)
-    removed = initial_len - cleaned_len
-    print(f"[Auto-Clean] Removed {removed} invalid or outlier rows (kept {cleaned_len}).")
-    return X, y
+# ============================================================
+# Unified Cleaning Function (with logs)
+# ============================================================
+# ============================================================
+# Training-only Cleaning Function (with logs)
+# ============================================================
+def clean_training_data(data: dict, model_type: str):
+    """
+    Cleans raw training data across all model types with detailed logs.
 
-# ==============================
-# LINEAR MODEL VALIDATION
-# ==============================
-def validate_linear_data(data: dict, department: str, is_training=True):
-    try:
-        if is_training:
-            # --- Extract and validate raw data ---
-            X = data.get("X")
-            y = data.get("y")
-            if X is None or y is None:
-                raise HTTPException(status_code=400, detail="Linear model requires 'X' and 'y'.")
-            X = np.array(X, dtype=float)
-            y = np.array(y, dtype=float).reshape(-1, 1)
-            if X.ndim == 1:
-                X = X.reshape(-1, 1)
-            if X.shape[0] != y.shape[0]:
-                raise HTTPException(status_code=400, detail="Length of 'X' and 'y' must match.")
-
-            # --- Clean and validate numeric content ---
-            X, y = clean_training_data(X, y)
-            if np.isnan(X).any() or np.isnan(y).any():
-                raise HTTPException(status_code=400, detail="Training data contains NaN values.")
-
-            # --- Initialize and fit scalers ---
-            scalers_X[department] = StandardScaler()
-            scalers_y[department] = StandardScaler()
-            X_scaled = scalers_X[department].fit_transform(X)
-            y_scaled = scalers_y[department].fit_transform(y)
-
-            # --- Save feature dimensions and scalers to `scalers/` folder ---
-            feature_dims[department] = X.shape[1]
-            save_department_scalers(department)
-
-            return {"X": X_scaled.tolist(), "y": y_scaled.tolist()}
-
-        else:
-            # --- Prediction phase ---
-            X = data.get("X")
-            if X is None:
-                raise HTTPException(status_code=400, detail="Linear prediction requires 'X'.")
-            X = np.array(X, dtype=float)
-            if np.isnan(X).any():
-                raise HTTPException(status_code=400, detail="Input contains NaN values.")
-            if X.ndim == 1:
-                X = X.reshape(-1, 1)
-
-            # --- Load scalers from `scalers/` folder ---
-            load_department_scalers(department)
-            if department not in scalers_X:
-                raise HTTPException(status_code=400, detail=f"No scaler found for '{department}'. Train first.")
-
-            expected_dim = feature_dims.get(department)
-            if expected_dim and X.shape[1] != expected_dim:
-                raise HTTPException(status_code=400, detail=f"Expected {expected_dim} features, got {X.shape[1]}.")
-
-            X_scaled = scalers_X[department].transform(X)
-            if np.isnan(X_scaled).any():
-                raise HTTPException(status_code=400, detail="Scaled input produced NaNs — check scaler integrity.")
-
-            return {"X": X_scaled.tolist(), "y": None}
-
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid numeric values in X or y.")
-
-# ==============================
-# ARIMA VALIDATION
-# ==============================
-def validate_arima_data(data: dict, is_training=True):
-    values = data.get("values")
-    if is_training:
-        if not values or len(values) < 3:
-            raise HTTPException(status_code=400, detail="ARIMA requires at least 3 'values'.")
-    else:
-        if "steps_ahead" not in data:
-            raise HTTPException(status_code=400, detail="ARIMA prediction requires 'steps_ahead'.")
-    return data
-
-# ==============================
-# PROPHET VALIDATION
-# ==============================
-def validate_prophet_data(data: dict, is_training=True):
-    if is_training:
-        dates = data.get("dates")
-        values = data.get("values")
-        if not dates or not values:
-            raise HTTPException(status_code=400, detail="Prophet requires 'dates' and 'values'.")
-        if len(dates) != len(values):
-            raise HTTPException(status_code=400, detail="'dates' and 'values' must have equal length.")
-    else:
-        if "steps_ahead" not in data:
-            raise HTTPException(status_code=400, detail="Prophet prediction requires 'steps_ahead'.")
-    return data
-
-# ==============================
-# DISPATCHER
-# ==============================
-def validate_and_normalize(model_type: str, data, is_training=True, department: str = None) -> dict:
+    Performs:
+      - NaN removal
+      - Duplicate removal (if applicable)
+      - Outlier removal (via z-score)
+    """
     model_type = model_type.lower()
-    print(f"\n[DEBUG] === validate_and_normalize() called ===")
-    print(f"[DEBUG] model_type={model_type}, is_training={is_training}, department={department}")
+    print(f"\n🧹 Starting cleaning for model_type='{model_type}'")
 
+    # -----------------------------
+    # LINEAR MODEL CLEANING
+    # -----------------------------
     if model_type == "linear":
-        if department is None:
-            raise HTTPException(status_code=400, detail="Department is required for Linear model validation.")
-        return validate_linear_data(data, department, is_training)
+        if not all(k in data for k in ("X", "y")):
+            raise HTTPException(status_code=400, detail="Linear model data must include 'X' and 'y'.")
 
+        X = np.array(data["X"], dtype=float)
+        y = np.array(data["y"], dtype=float)
+        print(f"Initial Linear data: X={X.shape}, y={y.shape}")
+
+        # Remove NaNs
+        valid_mask = ~np.isnan(X).any(axis=1) & ~np.isnan(y)
+        removed_nans = np.count_nonzero(~valid_mask)
+        X, y = X[valid_mask], y[valid_mask]
+        print(f"Removed {removed_nans} NaN rows. Remaining: {len(X)} samples")
+
+        # Remove duplicates
+        if len(X) > 1:
+            unique_X, unique_idx = np.unique(X, axis=0, return_index=True)
+            removed_dupes = len(X) - len(unique_X)
+            X, y = X[unique_idx], y[unique_idx]
+            print(f"Removed {removed_dupes} duplicate rows. Remaining: {len(X)} samples")
+
+        # Outlier removal
+        mask = _zscore_mask(y)
+        removed_outliers = np.count_nonzero(~mask)
+        X, y = X[mask], y[mask]
+        print(f"Removed {removed_outliers} outliers. Final count: {len(X)} samples")
+
+        print("🧾 Summary (LINEAR):", {"X_shape": X.shape, "y_shape": y.shape, "returned_samples": len(X)})
+        return {"X": X.tolist(), "y": y.tolist()}
+
+    # -----------------------------
+    # ARIMA MODEL CLEANING
+    # -----------------------------
     elif model_type == "arima":
-        return validate_arima_data(data, is_training)
+        if "values" not in data:
+            raise HTTPException(status_code=400, detail="ARIMA model data must include 'values'.")
 
+        values = np.array(data["values"], dtype=float)
+        print(f"Initial ARIMA data: {len(values)} samples")
+
+        # 1️⃣ Remove NaNs
+        before = len(values)
+        values = values[~np.isnan(values)]
+        removed_nans = before - len(values)
+        print(f"Removed {removed_nans} NaN values. Remaining: {len(values)} samples")
+
+        # 3️⃣ Remove outliers using z-score
+        mask = _zscore_mask(values)
+        removed_outliers = np.count_nonzero(~mask)
+        values = values[mask]
+        print(f"Removed {removed_outliers} outliers. Final count: {len(values)} samples")
+
+        print("🧾 Summary (ARIMA):", {
+            "returned_samples": len(values),
+            "first_values": values[:5].tolist()
+        })
+
+        return {"values": values.tolist()}
+
+    # -----------------------------
+    # PROPHET MODEL CLEANING
+    # -----------------------------
     elif model_type == "prophet":
-        return validate_prophet_data(data, is_training)
+        if not all(k in data for k in ("dates", "values")):
+            raise HTTPException(status_code=400, detail="Prophet model data must include 'dates' and 'values'.")
 
+        dates = np.array(data["dates"], dtype=str)
+        values = np.array(data["values"], dtype=float)
+        print(f"Initial Prophet data: {len(values)} samples")
+
+        # 1️⃣ Remove NaNs
+        valid_mask = ~np.isnan(values)
+        removed_nans = np.count_nonzero(~valid_mask)
+        dates, values = dates[valid_mask], values[valid_mask]
+        print(f"Removed {removed_nans} NaN values. Remaining: {len(values)} samples")
+
+        # 2️⃣ Remove duplicates based on dates (keep first occurrence)
+        _, unique_idx = np.unique(dates, return_index=True)
+        removed_dupes = len(dates) - len(unique_idx)
+        dates, values = dates[unique_idx], values[unique_idx]
+        print(f"Removed {removed_dupes} duplicate dates. Remaining: {len(values)} samples")
+
+        # 3️⃣ Remove outliers using z-score
+        mask = _zscore_mask(values)
+        removed_outliers = np.count_nonzero(~mask)
+        dates, values = dates[mask], values[mask]
+        print(f"Removed {removed_outliers} outliers. Final count: {len(values)} samples")
+
+        print("🧾 Summary (PROPHET):", {
+            "returned_samples": len(values),
+            "first_dates": dates[:3].tolist(),
+            "first_values": values[:3].tolist()
+        })
+
+        return {"dates": dates.tolist(), "values": values.tolist()}
+
+    # -----------------------------
+    # UNSUPPORTED MODEL TYPE
+    # -----------------------------
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported model_type: {model_type}")
 
-# ==============================
-# Y-INVERSE TRANSFORM
-# ==============================
-def inverse_transform_y(y_scaled, department: str):
-    if department not in scalers_y:
-        raise HTTPException(status_code=400, detail=f"No y scaler found for '{department}'. Train first.")
-    return scalers_y[department].inverse_transform(y_scaled)
+def clean_prediction_data(data: dict, model_type: str):
+    model_type = model_type.lower()
+    print(f"\n🧹 Starting prediction cleaning for model_type='{model_type}'")
+
+    if model_type == "linear":
+        if "X" not in data:
+            raise HTTPException(status_code=400, detail="Prediction input must include 'X'.")
+        X = np.array(data["X"], dtype=float)
+
+        # Remove NaNs
+        valid_mask = ~np.isnan(X).any(axis=1)
+        X = X[valid_mask]
+
+        # Remove duplicates
+        if len(X) > 1:
+            X = np.unique(X, axis=0)
+
+        print("🧾 Summary (LINEAR PREDICT):", {"X_shape": X.shape, "returned_samples": len(X)})
+        return {"X": X.tolist()}
+
+    elif model_type == "arima":
+        if "values" not in data:
+            raise HTTPException(status_code=400, detail="ARIMA prediction must include 'values'.")
+
+        values = np.array(data["values"], dtype=float)
+        print(f"Initial ARIMA prediction data: {len(values)} samples")
+
+        # Remove NaNs only
+        before = len(values)
+        values = values[~np.isnan(values)]
+        removed_nans = before - len(values)
+        print(f"Removed {removed_nans} NaN values. Remaining: {len(values)} samples")
+
+        # ✅ No duplicate or outlier removal in prediction
+        print("🧾 Summary (ARIMA PREDICT):", {
+            "returned_samples": len(values),
+            "first_values": values[:5].tolist()
+        })
+
+        return {"values": values.tolist()}
+
+    elif model_type == "prophet":
+        if not all(k in data for k in ("dates", "values")):
+            raise HTTPException(status_code=400, detail="Prophet prediction must include 'dates' and 'values'.")
+
+        dates = np.array(data["dates"], dtype=str)
+        values = np.array(data["values"], dtype=float)
+        print(f"Initial Prophet prediction data: {len(values)} samples")
+
+        # Remove NaNs
+        valid_mask = ~np.isnan(values)
+        removed_nans = np.count_nonzero(~valid_mask)
+        dates, values = dates[valid_mask], values[valid_mask]
+        print(f"Removed {removed_nans} NaN values. Remaining: {len(values)} samples")
+
+        # Remove duplicate dates (keep first)
+        unique_dates, unique_idx = np.unique(dates, return_index=True)
+        removed_dupes = len(dates) - len(unique_dates)
+        dates, values = dates[unique_idx], values[unique_idx]
+        print(f"Removed {removed_dupes} duplicate dates. Remaining: {len(values)} samples")
+
+        print("🧾 Summary (PROPHET PREDICT):", {
+            "returned_samples": len(values),
+            "first_dates": dates[:3].tolist(),
+            "first_values": values[:3].tolist()
+        })
+
+        return {"dates": dates.tolist(), "values": values.tolist()}
+
+# ============================================================
+# Validation Functions (Optional Layer)
+# ============================================================
+def validate_linear_data(data: dict):
+    """Ensure Linear data is non-empty and properly shaped."""
+    X, y = np.array(data["X"]), np.array(data["y"])
+    if len(X) == 0 or len(y) == 0:
+        raise HTTPException(status_code=400, detail="Linear data cannot be empty after cleaning.")
+    if len(X) != len(y):
+        raise HTTPException(status_code=400, detail="X and y must have the same number of samples.")
+    return True
+
+
+def validate_arima_data(data: dict):
+    """Ensure ARIMA data is non-empty."""
+    values = np.array(data["values"])
+    if len(values) < 5:
+        raise HTTPException(status_code=400, detail="ARIMA requires at least 5 data points.")
+    return True
+
+
+def validate_prophet_data(data: dict):
+    """Ensure Prophet data is valid."""
+    dates, values = np.array(data["dates"]), np.array(data["values"])
+    if len(dates) != len(values) or len(dates) < 5:
+        raise HTTPException(status_code=400, detail="Prophet requires at least 5 data points.")
+    return True

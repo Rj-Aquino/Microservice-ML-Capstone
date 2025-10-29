@@ -3,148 +3,213 @@ import json
 from fastapi import HTTPException
 import joblib
 import numpy as np
-from pytest import Session
+from sqlalchemy.orm import Session
 
-from database import SessionLocal, TrainingInput, parse_payload_loose
+from database import SessionLocal, TrainingInput  # ✅ updated import
 
-
-SCALERS_DIR = "./scalers"  # ✅ use only this folder
+# =======================================
+# CONSTANTS AND REGISTRIES
+# =======================================
+SCALERS_DIR = "./scalers"
 BASE_MODEL_DIR = "saved_models"
 os.makedirs(SCALERS_DIR, exist_ok=True)
+os.makedirs(BASE_MODEL_DIR, exist_ok=True)
 
 scalers_X = {}
 scalers_y = {}
 feature_dims = {}
 
-# ----------------------
-# Helper: get scaler file path
-# ----------------------
+# =======================================
+# PATH HELPERS
+# =======================================
 def get_scaler_path(department: str, scaler_type: str):
     """Return the file path for a department's scaler."""
     return os.path.join(SCALERS_DIR, f"{department}_scaler_{scaler_type}.pkl")
 
-# ----------------------
-# Save scalers
-# ----------------------
+
+# =======================================
+# SAVE SCALERS
+# =======================================
 def save_department_scalers(department: str):
     """Persist both X and y scalers and feature dimension info."""
     if department in scalers_X and department in scalers_y:
         x_scaler, y_scaler = scalers_X[department], scalers_y[department]
         if not hasattr(x_scaler, "mean_") or not hasattr(y_scaler, "mean_"):
-            print(f"[Warning] Skipping save — scalers for {department} are not fitted yet.")
+            print(f"[Warning] Skipping save — scalers for {department} not fitted yet.")
             return
 
         joblib.dump(x_scaler, get_scaler_path(department, "X"))
         joblib.dump(y_scaler, get_scaler_path(department, "y"))
+
         meta_path = os.path.join(SCALERS_DIR, f"{department}_meta.json")
         with open(meta_path, "w") as f:
             json.dump({"feature_dim": feature_dims.get(department)}, f)
+        print(f"[Scalers] ✅ Saved scalers for {department}")
 
-# ----------------------
-# Load scalers
-# ----------------------
+
+# =======================================
+# LOAD SCALERS
+# =======================================
 def load_department_scalers(department: str):
-    """Load department scalers and metadata if available, with validation."""
+    """Load department scalers and metadata if available."""
     x_path = get_scaler_path(department, "X")
     y_path = get_scaler_path(department, "y")
     meta_path = os.path.join(SCALERS_DIR, f"{department}_meta.json")
 
     if not (os.path.exists(x_path) and os.path.exists(y_path)):
-        raise HTTPException(status_code=400, detail=f"No saved scalers found for department '{department}'. Train first.")
+        raise HTTPException(status_code=400, detail=f"No saved scalers found for '{department}'. Train first.")
 
-    # Load both scalers
+    # Load scalers
     scalers_X[department] = joblib.load(x_path)
     scalers_y[department] = joblib.load(y_path)
-
-    # Validate that the scalers are fitted (mean_ and scale_ exist)
     x_scaler = scalers_X[department]
-    if not hasattr(x_scaler, "mean_") or not hasattr(x_scaler, "scale_"):
-        raise HTTPException(status_code=400, detail=f"Scaler for '{department}' is not properly fitted or corrupted.")
 
-    # Load meta info (feature dimensions)
+    # Validate integrity
+    if not hasattr(x_scaler, "mean_") or not hasattr(x_scaler, "scale_"):
+        raise HTTPException(status_code=400, detail=f"Scaler for '{department}' is corrupted or not fitted.")
+    if np.isnan(x_scaler.mean_).any() or np.isnan(x_scaler.scale_).any():
+        raise HTTPException(status_code=400, detail=f"Scaler for '{department}' contains NaN values.")
+
+    # Load meta info
     if os.path.exists(meta_path):
         with open(meta_path, "r") as f:
             meta = json.load(f)
             feature_dims[department] = meta.get("feature_dim")
 
-    # If meta missing, recover from scaler directly
+    # Recover missing dimension if needed
     if department not in feature_dims or feature_dims[department] is None:
         feature_dims[department] = len(x_scaler.mean_)
 
-    # Final safeguard: check mean_ for NaN
-    if np.isnan(x_scaler.mean_).any() or np.isnan(x_scaler.scale_).any():
-        raise HTTPException(status_code=400, detail=f"Scaler for '{department}' contains NaN values.")
+    print(f"[Scalers] ✅ Loaded scalers for {department} (features={feature_dims[department]})")
 
-# ----------------------
-# Delete scalers and models for a department
-# ----------------------
+
+# =======================================
+# DELETE + RETRAIN WORKFLOW
+# =======================================
 def delete_and_retrain_department(department: str, model_type: str):
     """
-    Deletes all model/scaler files for a department + model_type,
-    then retrains the model from remaining data in the database.
+    Deletes the model and scaler files for a specific department + model_type,
+    then retrains the model using remaining entries in the database.
     """
-
-    from models import train_model
-
+    from models import train_model  # local import to avoid circular dependency
     deleted_files = []
 
-    # --- Delete model files only ---
+    # ----------------------------
+    # DELETE MODEL FILES (specific model only)
+    # ----------------------------
     dept_folder = os.path.join(BASE_MODEL_DIR, department)
-    if os.path.exists(dept_folder):
-        for file in os.listdir(dept_folder):
-            path = os.path.join(dept_folder, file)
-            os.remove(path)
-            deleted_files.append(path)
+    model_filename = f"{department}_{model_type.lower()}.pkl"
+    model_path = os.path.join(dept_folder, model_filename)
 
-    # --- Delete scalers ---
+    if os.path.exists(model_path):
+        os.remove(model_path)
+        deleted_files.append(model_path)
+        print(f"[Model] 🗑️ Deleted {model_type} model for {department}")
+    else:
+        print(f"[Model] ⚠️ No {model_type} model found for {department} to delete")
+
+    # ----------------------------
+    # DELETE SCALER FILES (specific department only)
+    # ----------------------------
     scaler_files = [
         f"{department}_scaler_X.pkl",
         f"{department}_scaler_y.pkl",
-        f"{department}_meta.json"
+        f"{department}_meta.json",
     ]
-
-    for file_name in scaler_files:
-        path = os.path.join(SCALERS_DIR, file_name)
+    for fname in scaler_files:
+        path = os.path.join(SCALERS_DIR, fname)
         if os.path.exists(path):
             os.remove(path)
             deleted_files.append(path)
+            print(f"[Scaler] 🗑️ Deleted {fname}")
 
-    # Remove in-memory references
-    if department in scalers_X: del scalers_X[department]
-    if department in scalers_y: del scalers_y[department]
-    if department in feature_dims: del feature_dims[department]
+    # Remove in-memory copies
+    scalers_X.pop(department, None)
+    scalers_y.pop(department, None)
+    feature_dims.pop(department, None)
 
-    print(f"[DEBUG] Deleted all model and scaler assets for {department}")
+    print(f"[Clean-up] ✅ Cleared scalers and model for '{department}' ({model_type})")
 
-    # --- Fetch remaining training data from DB ---
+    # ----------------------------
+    # RETRAIN USING REMAINING DB DATA
+    # ----------------------------
     db: Session = SessionLocal()
     try:
-        query = db.query(TrainingInput).filter(
-            TrainingInput.department == department,
-            TrainingInput.model_type == model_type
+        remaining = (
+            db.query(TrainingInput)
+            .filter(
+                TrainingInput.department == department,
+                TrainingInput.model_type == model_type.lower()
+            )
+            .all()
         )
-        remaining_entries = query.all()
-        if not remaining_entries:
-            print(f"[DEBUG] No remaining data for {department} / {model_type}. Skipping retrain.")
-            return {"deleted_files": deleted_files, "retrained": False, "message": "No remaining data to retrain."}
 
-        # Combine all remaining data
-        combined_X, combined_y = [], []
-        for entry in remaining_entries:
-            payload = parse_payload_loose(entry.payload)
+        if not remaining:
+            return {
+                "deleted_files": deleted_files,
+                "retrained": False,
+                "message": f"No remaining data found for {department}/{model_type}.",
+            }
+
+        # Combine all valid payloads
+        combined_data = {"X": [], "y": [], "values": [], "dates": []}
+
+        for entry in remaining:
+            payload = entry.payload
+            if not isinstance(payload, dict):
+                continue
+
+            # Merge data based on structure
             if "X" in payload and "y" in payload:
-                combined_X.extend(payload["X"])
-                combined_y.extend(payload["y"])
+                combined_data["X"].extend(payload["X"])
+                combined_data["y"].extend(payload["y"])
+            elif "values" in payload:
+                combined_data["values"].extend(payload["values"])
+                if "dates" in payload:
+                    combined_data["dates"].extend(payload["dates"])
 
-        if not combined_X or not combined_y:
-            return {"deleted_files": deleted_files, "retrained": False, "message": "Remaining entries have no valid X/y."}
+        # Prepare training data by model type
+        if model_type.lower() == "linear":
+            if not combined_data["X"] or not combined_data["y"]:
+                return {
+                    "deleted_files": deleted_files,
+                    "retrained": False,
+                    "message": "No valid Linear data remaining.",
+                }
+            train_data = {"X": combined_data["X"], "y": combined_data["y"]}
 
-        retrain_data = {"X": combined_X, "y": combined_y}
+        elif model_type.lower() == "arima":
+            if not combined_data["values"]:
+                return {
+                    "deleted_files": deleted_files,
+                    "retrained": False,
+                    "message": "No valid ARIMA data remaining.",
+                }
+            train_data = {"values": combined_data["values"]}
 
-        # --- Retrain model ---
-        train_model(department, model_type, retrain_data)
-        print(f"[DEBUG] Retrained {model_type} model for {department} from remaining data.")
+        elif model_type.lower() == "prophet":
+            if not combined_data["dates"] or not combined_data["values"]:
+                return {
+                    "deleted_files": deleted_files,
+                    "retrained": False,
+                    "message": "No valid Prophet data remaining.",
+                }
+            train_data = {"dates": combined_data["dates"], "values": combined_data["values"]}
 
-        return {"deleted_files": deleted_files, "retrained": True, "message": "Model retrained from remaining data."}
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported model_type: {model_type}")
+
+        # ----------------------------
+        # RETRAIN MODEL
+        # ----------------------------
+        train_model(department, model_type, train_data)
+        print(f"[Retrain] ✅ Retrained {model_type} model for {department} using remaining data.")
+
+        return {
+            "deleted_files": deleted_files,
+            "retrained": True,
+            "message": f"{model_type.upper()} retrained successfully for {department}.",
+        }
+
     finally:
         db.close()
