@@ -121,7 +121,7 @@ def get_all_training_inputs(
 ):
     """
     Retrieve all stored training inputs, optionally filtered by department or model_type.
-    Returns minimal metadata and sample preview for each entry.
+    Returns full payloads (no truncation).
     """
     db: Session = SessionLocal()
     try:
@@ -136,14 +136,10 @@ def get_all_training_inputs(
 
         for entry in entries:
             payload = entry.payload
-            preview = {}
 
-            # Provide a short preview (first few elements only)
-            if isinstance(payload, dict):
-                for k, v in payload.items():
-                    preview[k] = v[:5] if isinstance(v, list) else v
-            elif isinstance(payload, list):
-                preview = payload[:5]
+            # ✅ Show full payload
+            if isinstance(payload, (dict, list)):
+                preview = payload
             else:
                 preview = str(payload)
 
@@ -152,7 +148,7 @@ def get_all_training_inputs(
                 "department": entry.department,
                 "model_type": entry.model_type,
                 "timestamp": entry.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                "payload_preview": preview,
+                "payload": preview,  # full data shown here
             })
 
         return results
@@ -162,3 +158,4 @@ def get_all_training_inputs(
 
     finally:
         db.close()
+

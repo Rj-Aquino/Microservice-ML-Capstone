@@ -97,8 +97,28 @@ def train_model(department: str, model_type: str, cleaned_data: dict):
             raise HTTPException(status_code=400, detail="ARIMA requires ≥ 3 samples")
 
         print(f"📊 ARIMA input size: {len(values)} samples")
-        model = ARIMA(values, order=(2, 1, 2))
-        model_fit = model.fit()
+
+        # ⚙️ Use safer ARIMA settings for small or unstable data
+        try:
+            model = ARIMA(
+                values,
+                order=(2, 1, 2),
+                enforce_stationarity=False,
+                enforce_invertibility=False
+            )
+            model_fit = model.fit()
+        except Exception as e:
+            print(f"⚠️ ARIMA fitting failed with order (2,1,2): {e}")
+            # fallback to a simpler, more stable configuration
+            model = ARIMA(
+                values,
+                order=(1, 1, 1),
+                enforce_stationarity=False,
+                enforce_invertibility=False
+            )
+            model_fit = model.fit()
+
+        # ✅ Save model
         model_fit.save(get_model_path(department, "arima", "pkl"))
         print("🧠 ARIMA model trained and saved")
 

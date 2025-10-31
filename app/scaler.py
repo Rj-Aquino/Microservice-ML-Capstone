@@ -88,17 +88,23 @@ def load_department_scalers(department: str):
 # =======================================
 def delete_and_retrain_department(department: str, model_type: str):
     """
-    Deletes the model and scaler files for a specific department + model_type,
+    Deletes the model and (if applicable) scaler files for a specific department + model_type,
     then retrains the model using remaining entries in the database.
     """
     from models import train_model  # local import to avoid circular dependency
     deleted_files = []
 
-    # ----------------------------
-    # DELETE MODEL FILES (specific model only)
-    # ----------------------------
+    model_type_lower = model_type.lower()
     dept_folder = os.path.join(BASE_MODEL_DIR, department)
-    model_filename = f"{department}_{model_type.lower()}.pkl"
+
+    # ----------------------------
+    # DELETE MODEL FILES
+    # ----------------------------
+    if model_type_lower == "prophet":
+        model_filename = f"model_{model_type_lower}.json"
+    else:
+        model_filename = f"model_{model_type_lower}.pkl"
+
     model_path = os.path.join(dept_folder, model_filename)
 
     if os.path.exists(model_path):
@@ -109,26 +115,29 @@ def delete_and_retrain_department(department: str, model_type: str):
         print(f"[Model] ⚠️ No {model_type} model found for {department} to delete")
 
     # ----------------------------
-    # DELETE SCALER FILES (specific department only)
+    # DELETE SCALER FILES (only for LINEAR)
     # ----------------------------
-    scaler_files = [
-        f"{department}_scaler_X.pkl",
-        f"{department}_scaler_y.pkl",
-        f"{department}_meta.json",
-    ]
-    for fname in scaler_files:
-        path = os.path.join(SCALERS_DIR, fname)
-        if os.path.exists(path):
-            os.remove(path)
-            deleted_files.append(path)
-            print(f"[Scaler] 🗑️ Deleted {fname}")
+    if model_type_lower == "linear":
+        scaler_files = [
+            f"{department}_scaler_X.pkl",
+            f"{department}_scaler_y.pkl",
+            f"{department}_meta.json",
+        ]
+        for fname in scaler_files:
+            path = os.path.join(SCALERS_DIR, fname)
+            if os.path.exists(path):
+                os.remove(path)
+                deleted_files.append(path)
+                print(f"[Scaler] 🗑️ Deleted {fname}")
 
-    # Remove in-memory copies
-    scalers_X.pop(department, None)
-    scalers_y.pop(department, None)
-    feature_dims.pop(department, None)
+        # Remove in-memory copies (Linear only)
+        scalers_X.pop(department, None)
+        scalers_y.pop(department, None)
+        feature_dims.pop(department, None)
 
-    print(f"[Clean-up] ✅ Cleared scalers and model for '{department}' ({model_type})")
+        print(f"[Clean-up] ✅ Cleared scalers and model for '{department}' ({model_type})")
+    else:
+        print(f"[Clean-up] ✅ Cleared only model for '{department}' ({model_type}) — no scalers used")
 
     # ----------------------------
     # RETRAIN USING REMAINING DB DATA
@@ -139,7 +148,7 @@ def delete_and_retrain_department(department: str, model_type: str):
             db.query(TrainingInput)
             .filter(
                 TrainingInput.department == department,
-                TrainingInput.model_type == model_type.lower()
+                TrainingInput.model_type == model_type_lower
             )
             .all()
         )
@@ -151,7 +160,6 @@ def delete_and_retrain_department(department: str, model_type: str):
                 "message": f"No remaining data found for {department}/{model_type}.",
             }
 
-        # Combine all valid payloads
         combined_data = {"X": [], "y": [], "values": [], "dates": []}
 
         for entry in remaining:
@@ -159,7 +167,6 @@ def delete_and_retrain_department(department: str, model_type: str):
             if not isinstance(payload, dict):
                 continue
 
-            # Merge data based on structure
             if "X" in payload and "y" in payload:
                 combined_data["X"].extend(payload["X"])
                 combined_data["y"].extend(payload["y"])
@@ -168,32 +175,19 @@ def delete_and_retrain_department(department: str, model_type: str):
                 if "dates" in payload:
                     combined_data["dates"].extend(payload["dates"])
 
-        # Prepare training data by model type
-        if model_type.lower() == "linear":
+        if model_type_lower == "linear":
             if not combined_data["X"] or not combined_data["y"]:
-                return {
-                    "deleted_files": deleted_files,
-                    "retrained": False,
-                    "message": "No valid Linear data remaining.",
-                }
+                return {"deleted_files": deleted_files, "retrained": False, "message": "No valid Linear data remaining."}
             train_data = {"X": combined_data["X"], "y": combined_data["y"]}
 
-        elif model_type.lower() == "arima":
+        elif model_type_lower == "arima":
             if not combined_data["values"]:
-                return {
-                    "deleted_files": deleted_files,
-                    "retrained": False,
-                    "message": "No valid ARIMA data remaining.",
-                }
+                return {"deleted_files": deleted_files, "retrained": False, "message": "No valid ARIMA data remaining."}
             train_data = {"values": combined_data["values"]}
 
-        elif model_type.lower() == "prophet":
+        elif model_type_lower == "prophet":
             if not combined_data["dates"] or not combined_data["values"]:
-                return {
-                    "deleted_files": deleted_files,
-                    "retrained": False,
-                    "message": "No valid Prophet data remaining.",
-                }
+                return {"deleted_files": deleted_files, "retrained": False, "message": "No valid Prophet data remaining."}
             train_data = {"dates": combined_data["dates"], "values": combined_data["values"]}
 
         else:
@@ -202,7 +196,7 @@ def delete_and_retrain_department(department: str, model_type: str):
         # ----------------------------
         # RETRAIN MODEL
         # ----------------------------
-        train_model(department, model_type, train_data)
+        train_model(department, model_type_lower, train_data)
         print(f"[Retrain] ✅ Retrained {model_type} model for {department} using remaining data.")
 
         return {

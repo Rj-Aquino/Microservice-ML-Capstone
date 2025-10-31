@@ -5,25 +5,40 @@ from fastapi import HTTPException
 # ============================================================
 # Helper: Z-score mask for outlier detection
 # ============================================================
-def _zscore_mask(values: np.ndarray, threshold: float = 2.0):
+def _outlier_mask(values: np.ndarray, method: str = "iqr", z_thresh: float = 2.5):
     """
-    Boolean mask to remove outliers using z-score.
-    - Uses sample std (ddof=1) for better sensitivity on small datasets.
-    - If std is 0 or dataset < 2 points, no points are removed.
+    Returns a boolean mask to keep valid (non-outlier) values.
+
+    Supports:
+      - IQR-based detection (default): better for small datasets.
+      - Z-score fallback for larger, normally distributed data.
+
+    Parameters:
+      values: numeric array
+      method: "iqr" | "zscore"
+      z_thresh: threshold for z-score method
     """
     values = np.array(values, dtype=float)
     n = len(values)
 
-    if n < 2:  # Too few points to reliably detect outliers
+    if n < 3:
         return np.ones(n, dtype=bool)
 
+    # IQR Method (default)
+    if method == "iqr":
+        q1, q3 = np.percentile(values, [25, 75])
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        return (values >= lower) & (values <= upper)
+
+    # Z-score fallback
     mean = values.mean()
-    std = values.std(ddof=1)  # sample std
+    std = values.std(ddof=1)
     if std == 0:
         return np.ones(n, dtype=bool)
-
     z_scores = np.abs((values - mean) / std)
-    return z_scores < threshold
+    return z_scores < z_thresh
 
 # ============================================================
 # Unified Cleaning Function (with logs)
@@ -67,8 +82,8 @@ def clean_training_data(data: dict, model_type: str):
             X, y = X[unique_idx], y[unique_idx]
             print(f"Removed {removed_dupes} duplicate rows. Remaining: {len(X)} samples")
 
-        # Outlier removal
-        mask = _zscore_mask(y)
+        # ✅ Outlier removal (use y, not values)
+        mask = _outlier_mask(y)
         removed_outliers = np.count_nonzero(~mask)
         X, y = X[mask], y[mask]
         print(f"Removed {removed_outliers} outliers. Final count: {len(X)} samples")
@@ -93,7 +108,7 @@ def clean_training_data(data: dict, model_type: str):
         print(f"Removed {removed_nans} NaN values. Remaining: {len(values)} samples")
 
         # 3️⃣ Remove outliers using z-score
-        mask = _zscore_mask(values)
+        mask = _outlier_mask(values)
         removed_outliers = np.count_nonzero(~mask)
         values = values[mask]
         print(f"Removed {removed_outliers} outliers. Final count: {len(values)} samples")
@@ -129,7 +144,7 @@ def clean_training_data(data: dict, model_type: str):
         print(f"Removed {removed_dupes} duplicate dates. Remaining: {len(values)} samples")
 
         # 3️⃣ Remove outliers using z-score
-        mask = _zscore_mask(values)
+        mask = _outlier_mask(values)
         removed_outliers = np.count_nonzero(~mask)
         dates, values = dates[mask], values[mask]
         print(f"Removed {removed_outliers} outliers. Final count: {len(values)} samples")
