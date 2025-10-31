@@ -23,6 +23,27 @@ from scaler import get_scaler_path
 BASE_MODEL_DIR = "saved_models"
 SCALER_DIR = "scalers"
 DEPARTMENTS = ["Operations", "Finance", "Inventory", "HR"]
+UPLOAD_DIR = "uploaded_datasets"
+
+def load_uploaded_dataset(dataset_id: str) -> dict:
+    """Load uploaded dataset by ID (CSV or JSON) and return as dict."""
+    csv_path = os.path.join(UPLOAD_DIR, f"{dataset_id}.csv")
+    json_path = os.path.join(UPLOAD_DIR, f"{dataset_id}.json")
+
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+    elif os.path.exists(json_path):
+        df = pd.read_json(json_path)
+    else:
+        raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found.")
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail=f"Dataset {dataset_id} is empty.")
+
+    # Optional: drop nulls, duplicates
+    df = df.dropna().drop_duplicates()
+
+    return df.to_dict(orient="list")
 
 os.makedirs(BASE_MODEL_DIR, exist_ok=True)
 os.makedirs(SCALER_DIR, exist_ok=True)
