@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import Dict, Any, Optional
 
 from database import save_training_input, get_all_training_inputs, TrainingInput, SessionLocal, UploadedDataset
-from models import train_model, predict, validate, MODEL_INFO, load_uploaded_dataset
+from models import train_model, predict, validate, MODEL_INFO
 from preprocess import clean_training_data  
 from scaler import delete_and_retrain_department
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +16,7 @@ import pandas as pd
 import os
 import json
 
-from database import save_uploaded_dataset, get_uploaded_datasets, delete_uploaded_dataset
+from database import save_uploaded_dataset, get_uploaded_datasets, delete_uploaded_dataset, get_prepared_datasets, delete_prepared_dataset, PreparedDataset
 
 # =====================================================
 # ⚙️ APP INITIALIZATION
@@ -35,7 +35,7 @@ app.add_middleware(
 # 🧩 Pydantic Request Models
 # =====================================================
 class TrainingRequest(BaseModel):
-    dataset_id: Optional[str] = None
+    prepared_id: Optional[str] = None
     department: Optional[str] = None
     model_type: Optional[str] = None
     data: Optional[Dict[str, Any]] = None
@@ -70,51 +70,77 @@ async def get_model_info(model_type: str):
 # =====================================================
 @app.post("/train")
 async def train_model_endpoint(payload: TrainingRequest):
-    dataset_id = getattr(payload, "dataset_id", None)
-    data = payload.data  # Optional if using dataset_id
+    prepared_id = getattr(payload, "prepared_id", None)
+    data = getattr(payload, "data", None)
     department = None
     model_type = None
 
-    if not dataset_id and not data:
-        raise HTTPException(status_code=400, detail="Must provide either 'dataset_id' or raw 'data' for training.")
+    if not prepared_id and not data:
+        raise HTTPException(status_code=400, detail="Must provide either 'prepared_id' or raw 'data' for training.")
 
     # ============================
-    # 1️⃣ Load prepared dataset if dataset_id is provided
+    # 1️⃣ Load prepared dataset if prepared_id is provided
     # ============================
-    if dataset_id:
-        print(f"📂 Loading prepared dataset: {dataset_id}")
+    if prepared_id:
+        print(f"📂 Loading prepared dataset: {prepared_id}")
 
-        # Load prepared X/y
-        prepared_path = os.path.join(UPLOAD_DIR, f"{dataset_id}_prepared.json")
+        # Locate prepared dataset in DB
+        db = SessionLocal()
+        prepared_entry = db.query(PreparedDataset).filter(PreparedDataset.prepared_id == prepared_id).first()
+        if not prepared_entry:
+            db.close()
+            raise HTTPException(status_code=404, detail=f"Prepared dataset '{prepared_id}' not found in database.")
+
+        prepared_path = prepared_entry.prepared_json_path
         if not os.path.exists(prepared_path):
-            raise HTTPException(status_code=404, detail=f"Prepared JSON for dataset_id '{dataset_id}' not found.")
+            db.close()
+            raise HTTPException(status_code=404, detail=f"Prepared JSON file not found at '{prepared_path}'")
 
+        # Load prepared JSON
         with open(prepared_path, "r") as f:
-            prepared = json.load(f)
+            prepared_data = json.load(f)
 
-        X = prepared.get("X")
-        y = prepared.get("y")
-        if not X or not y:
-            raise HTTPException(status_code=400, detail="Prepared dataset missing 'X' or 'y'.")
-        data = {"X": X, "y": y}
+        model_type = prepared_entry.model_type.lower()
+        department = prepared_entry.department
 
-        # Load department/model_type from original uploaded dataset JSON
-        original_path = os.path.join(UPLOAD_DIR, f"{dataset_id}.json")
-        if os.path.exists(original_path):
-            with open(original_path, "r") as f:
-                meta = json.load(f)
-                department = meta.get("department")
-                model_type = meta.get("model_type", "").lower()
+        # Extract training data depending on model type
+        if model_type == "linear":
+            X = prepared_data.get("X")
+            y = prepared_data.get("y")
+            if not X or not y:
+                db.close()
+                raise HTTPException(status_code=400, detail="Prepared dataset missing 'X' or 'y' for linear model.")
+            data = {"X": X, "y": y}
+
+        elif model_type == "arima":
+            series = prepared_data.get("data", {}).get("values")
+            if not series:
+                db.close()
+                raise HTTPException(status_code=400, detail="Prepared ARIMA dataset missing 'values'.")
+            data = {"values": series}
+
+        elif model_type == "prophet":
+            prophet_data = prepared_data.get("data")
+            if not prophet_data:
+                db.close()
+                raise HTTPException(status_code=400, detail="Prepared Prophet dataset missing 'data'.")
+            data = prophet_data
+
+        else:
+            db.close()
+            raise HTTPException(status_code=400, detail=f"Unsupported model type '{model_type}'")
+
+        db.close()
 
     # ============================
-    # 2️⃣ If data is raw JSON, use provided payload metadata
+    # 2️⃣ If raw data provided (no prepared_id)
     # ============================
-    if data and not dataset_id:
+    elif data:
         department = getattr(payload, "department", None)
         model_type = getattr(payload, "model_type", None).lower() if getattr(payload, "model_type", None) else None
 
     # ============================
-    # 3️⃣ Validate department and model_type
+    # 3️⃣ Validate metadata
     # ============================
     valid_departments = ["Operations", "Finance", "Inventory", "HR"]
     valid_model_types = ["linear", "arima", "prophet"]
@@ -125,7 +151,7 @@ async def train_model_endpoint(payload: TrainingRequest):
         raise HTTPException(status_code=400, detail=f"Model type '{model_type}' not supported.")
 
     if not isinstance(data, dict):
-        raise HTTPException(status_code=400, detail="Invalid 'data' format — expected dict or dataset_id.")
+        raise HTTPException(status_code=400, detail="Invalid 'data' format — expected dict or prepared_id.")
 
     print(f"🚀 Starting training for {department} - {model_type}")
 
@@ -151,7 +177,7 @@ async def train_model_endpoint(payload: TrainingRequest):
         "detail": f"✅ Model trained successfully for {department} ({model_type}).",
         "department": department,
         "model_type": model_type,
-        "dataset_id": dataset_id or "N/A",
+        "prepared_id": prepared_id or "N/A",
         "result": result
     }
 
@@ -237,6 +263,9 @@ UPLOAD_DIR = "uploaded_datasets"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+# =====================================
+# Dataset Endpoints
+# =====================================
 @app.post("/upload-data")
 async def upload_data(
     department: str = Form(...),
@@ -268,6 +297,9 @@ async def upload_data(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dataset_id = f"{department}_{dataset_name}_{timestamp}"
 
+    # 🔹 Ensure upload directory exists
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+
     # 🔹 Save raw CSV
     csv_path = os.path.join(UPLOAD_DIR, f"{dataset_id}.csv")
     with open(csv_path, "wb") as buffer:
@@ -286,14 +318,17 @@ async def upload_data(
     df = df.dropna().drop_duplicates()
     data_json = df.to_dict(orient="list")
 
-    # 🔹 Save JSON
+    # 🔹 Save JSON representation
     json_path = os.path.join(UPLOAD_DIR, f"{dataset_id}.json")
     with open(json_path, "w") as f:
         json.dump({
+            "dataset_id": dataset_id,
             "department": department,
             "model_type": model_type.lower(),
             "dataset_name": dataset_name,
             "created_at": datetime.now().isoformat(),
+            "columns": list(df.columns),
+            "records": len(df),
             "data": data_json
         }, f, indent=2)
 
@@ -308,27 +343,47 @@ async def upload_data(
         "records": len(df),
         "columns": list(df.columns),
     }
-    save_uploaded_dataset(metadata)
+
+    saved_entry = save_uploaded_dataset(metadata)
 
     return {
         "message": "✅ Dataset uploaded and saved successfully.",
         "dataset_id": dataset_id,
         "records": len(df),
-        "columns": list(df.columns)
+        "columns": list(df.columns),
+        "db_id": saved_entry.get("id")
     }
 
+@app.get("/datasets")
+def list_datasets(
+    department: Optional[str] = None,
+    model_type: Optional[str] = None
+):
+    """List uploaded datasets."""
+    return get_uploaded_datasets(department, model_type)
+
+@app.delete("/datasets/{dataset_id}")
+def delete_dataset(dataset_id: str):
+    """Delete uploaded dataset."""
+    return delete_uploaded_dataset(dataset_id)
+
+# =====================================
+# Prepared Dataset Endpoints
+# =====================================
 @app.post("/prepare-dataset")
 async def prepare_dataset(
     dataset_id: str = Form(...),
     target_column: str = Form(...),
+    selected_columns: Optional[str] = Form(None),  # e.g. "date,feature1,feature2"
 ):
     db = SessionLocal()
+
+    # 🔹 Fetch uploaded dataset
     dataset = db.query(UploadedDataset).filter(UploadedDataset.dataset_id == dataset_id).first()
     if not dataset:
         db.close()
         return {"message": "❌ Dataset not found.", "dataset_id": dataset_id, "success": False}
 
-    # Check if JSON file exists
     if not os.path.exists(dataset.json_path):
         db.close()
         return {
@@ -337,55 +392,159 @@ async def prepare_dataset(
             "success": False
         }
 
-    # Load dataset JSON
+    # 🔹 Load dataset JSON
     with open(dataset.json_path, "r") as f:
-        data = json.load(f)["data"]
+        raw_data = json.load(f)["data"]
 
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(raw_data)
 
+    # 🔹 Apply column filtering (if specified)
+    if selected_columns:
+        selected_cols = [c.strip() for c in selected_columns.split(",") if c.strip()]
+
+        # 🚫 Prevent target column from being reselected
+        if target_column in selected_cols:
+            db.close()
+            return {
+                "message": f"❌ Target column '{target_column}' should not be included in 'selected_columns'.",
+                "success": False
+            }
+
+        # Check for missing selected columns
+        missing = [c for c in selected_cols if c not in df.columns]
+        if missing:
+            db.close()
+            return {"message": f"❌ Missing selected columns: {missing}", "success": False}
+
+        # Keep only selected + target column
+        df = df[selected_cols + [target_column]]
+
+    # 🔹 Validate target column
     if target_column not in df.columns:
         db.close()
         return {"message": f"❌ Target column '{target_column}' not found.", "dataset_id": dataset_id, "success": False}
 
-    # Convert and prepare data
-    X = df.drop(columns=[target_column])
-    y = df[target_column]
+    model_type = dataset.model_type.lower()
 
-    for col in X.columns:
-        if not pd.api.types.is_numeric_dtype(X[col]):
-            X[col] = pd.factorize(X[col])[0]
+    # 🔹 Generate a unique prepared ID
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prepared_id = f"{dataset_id}_prep_{timestamp}"
 
-    X_rows = X.values.tolist()
-    y_rows = y.tolist()
+    # 🔹 Build prepared data structure
+    if model_type == "linear":
+        X = df.drop(columns=[target_column])
+        y = df[target_column]
 
-    prepared_data = {
-        "department": dataset.department,
-        "model_type": dataset.model_type,
-        "X": X_rows,
-        "y": y_rows
-    }
+        for col in X.columns:
+            if not pd.api.types.is_numeric_dtype(X[col]):
+                X[col] = pd.factorize(X[col])[0]
 
-    prepared_path = os.path.join(UPLOAD_DIR, f"{dataset_id}_prepared.json")
+        prepared_data = {
+            "prepared_id": prepared_id,
+            "dataset_id": dataset_id,
+            "department": dataset.department,
+            "model_type": model_type,
+            "X_columns": list(X.columns),
+            "target_column": target_column,
+            "X": X.values.tolist(),
+            "y": y.tolist(),
+        }
+
+    elif model_type == "arima":
+        # Ensure target is numeric
+        if not pd.api.types.is_numeric_dtype(df[target_column]):
+            db.close()
+            return {"message": "❌ Target column must be numeric for ARIMA.", "success": False}
+
+        # Ensure no extra columns (ARIMA is univariate)
+        if len(df.columns) > 1:
+            db.close()
+            return {"message": "❌ ARIMA only supports one target column (no extra features).", "success": False}
+
+        prepared_data = {
+            "prepared_id": prepared_id,
+            "dataset_id": dataset_id,
+            "department": dataset.department,
+            "model_type": model_type,
+            "data": {"values": df[target_column].tolist()},
+            "target_column": target_column,
+        }
+
+    elif model_type == "prophet":
+        # Detect date/time column
+        date_cols = [col for col in df.columns if "date" in col.lower() or "time" in col.lower() or col.lower() == "ds"]
+        if not date_cols:
+            db.close()
+            return {"message": "❌ No date/time column found for Prophet.", "success": False}
+
+        # Ensure only date + target (2 columns max)
+        if len(df.columns) > 2:
+            db.close()
+            return {"message": "❌ Prophet currently supports only one date and one target column.", "success": False}
+
+        date_col = date_cols[0]
+
+        prepared_data = {
+            "prepared_id": prepared_id,
+            "dataset_id": dataset_id,
+            "department": dataset.department,
+            "model_type": model_type,
+            "data": {
+                "dates": df[date_col].astype(str).tolist(),
+                "values": df[target_column].tolist(),
+            },
+            "target_column": target_column,
+            "date_column": date_col,
+        }
+
+    else:
+        db.close()
+        return {"message": f"❌ Unsupported model type '{model_type}'.", "success": False}
+
+    # 🔹 Save prepared JSON
+    prepared_path = os.path.join(UPLOAD_DIR, f"{prepared_id}.json")
     with open(prepared_path, "w") as f:
         json.dump(prepared_data, f, indent=2)
 
+    # 🔹 Store in DB
+    prepared_entry = PreparedDataset(
+        prepared_id=prepared_id,
+        dataset_id=dataset.dataset_id,
+        uploaded_dataset_id=dataset.id,
+        department=dataset.department,
+        model_type=model_type,
+        target_column=target_column,
+        prepared_json_path=prepared_path,
+        columns_used=list(df.columns),
+        rename_map=None,
+        preprocessing_flags=None,
+        created_at=datetime.now(),
+    )
+
+    db.add(prepared_entry)
+    db.commit()
     db.close()
+
     return {
         "message": "✅ Dataset prepared successfully.",
+        "prepared_id": prepared_id,
         "dataset_id": dataset_id,
+        "model_type": model_type,
         "target_column": target_column,
-        "columns": list(X.columns),
+        "columns": list(df.columns),
         "prepared_path": prepared_path,
-        "success": True
+        "success": True,
     }
 
-@app.get("/datasets")
-def list_datasets(
+@app.get("/prepared-datasets")
+def list_prepared_datasets(
     department: Optional[str] = None,
-    model_type: Optional[str] = None
+    dataset_id: Optional[str] = None
 ):
-    return get_uploaded_datasets(department, model_type)
+    """List prepared datasets (optionally filtered by department or original dataset_id)."""
+    return get_prepared_datasets(department, dataset_id)
 
-@app.delete("/datasets/{dataset_id}")
-def delete_dataset(dataset_id: str):
-    return delete_uploaded_dataset(dataset_id)
+@app.delete("/prepared-datasets/{prepared_id}")
+def delete_prepared(prepared_id: str):
+    """Delete a prepared dataset and its file."""
+    return delete_prepared_dataset(prepared_id)

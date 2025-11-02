@@ -1,0 +1,28 @@
+{
+  "prepared_id": "Inventory_Test_20251102_163506_prep_20251102_164155",
+  "dataset_id": "Inventory_Test_20251102_163506",
+  "department": "Inventory",
+  "model_type": "prophet",
+  "data": {
+    "dates": [
+      "2025-01-01",
+      "2025-01-02",
+      "2025-01-03",
+      "2025-01-04",
+      "2025-01-05",
+      "2025-01-06",
+      "2025-01-07"
+    ],
+    "values": [
+      100,
+      120,
+      130,
+      140,
+      150,
+      160,
+      170
+    ]
+  },
+  "target_column": "revenue",
+  "date_column": "date"
+}
