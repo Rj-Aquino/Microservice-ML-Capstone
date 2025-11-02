@@ -5,3 +5,5 @@ __pycache__/
 saved_models/
 uploaded_datasets/
 scalars/
+.vscode
+CSV/
