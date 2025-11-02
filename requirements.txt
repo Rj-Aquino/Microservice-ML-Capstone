@@ -1,7 +1,10 @@
 fastapi
 uvicorn
-scikit-learn
+sqlalchemy
 pandas
 numpy
+scikit-learn
+statsmodels
+prophet
 joblib
 python-multipart

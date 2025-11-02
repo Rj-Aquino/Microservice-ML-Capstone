@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+*.db
+saved_models/
+uploaded_datasets/
