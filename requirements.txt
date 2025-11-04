@@ -8,3 +8,6 @@ statsmodels
 prophet
 joblib
 python-multipart
+psycopg2-binary
+python-dotenv
+pydantic
