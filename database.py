@@ -15,6 +15,9 @@ from sqlalchemy.orm import sessionmaker, relationship, Session
 from dotenv import load_dotenv
 from sqlalchemy.dialects.mysql import LONGBLOB
 
+import pymysql
+pymysql.install_as_MySQLdb()
+
 # ==========================================================
 # Database Setup (MySQL)
 # ==========================================================
